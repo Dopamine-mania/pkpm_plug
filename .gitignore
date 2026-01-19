@@ -1,0 +1,31 @@
+# Python / caches
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Local tooling
+.claude/
+
+# Generated / temp artifacts (keep sources, ignore extractions)
+tmp_*/
+tmp_*.docx
+tmp_*.pdf
+tmp_*.zip
+tmp_*.png
+tmp_*.jpg
+tmp_*.jpeg
+tmp_*.xlsx
+*.bak_*
+nul
+NUL
+Demond.zip
+~$*.docx
+
+# Too large for GitHub (use Releases / cloud storage instead)
+阶段成果/pkpm_composite_beam_V3.2_FINAL/pkpm_composite_beam_交付1.2.zip
+
+# OS
+.DS_Store
+Thumbs.db

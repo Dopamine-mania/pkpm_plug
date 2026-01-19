@@ -1,0 +1,1327 @@
+
+PyPCAE用户手册
+一、概览
+1、简介
+二、使用
+1、导入模块
+2、建立有限元模型
+2.1、材料
+2.2、截面
+2.3、节点
+2.4、单元
+2.5、集合
+2.5.1、节点集合
+2.5.2、单元集合
+2.5.3、接触单元
+2.5.4、接触面(接触单元集合)
+2.6、支座
+2.6.1、固定支座
+2.6.2、弹性支座
+2.6.3、隔震支座
+2.6.4、主从约束
+2.6.5、标准约束
+2.7、相互作用
+2.7.1、绑定
+2.7.2、耦合
+2.7.3、嵌入
+2.7.4、接触对
+2.7.5、连接器截面
+2.7.6、连接器
+2.8、荷载
+2.8.1、节点荷载
+2.8.2、节点位移
+2.8.3、线(单元/构件)荷载
+2.8.4、面(单元/构件)荷载
+2.8.5、面(单元/构件)边线荷载
+2.8.6、体荷载
+2.8.7、体(单元/构件)表面荷载
+2.8.8、静水压力
+2.8.9、动力波
+2.8.10、节点温度
+2.9、分析
+2.9.1、单元杀死激活
+2.9.2、工况组合
+2.9.3、荷载步
+2.9.4、预应力/应变
+2.9.5、初始速度
+2.9.6、随机振动分析相关
+2.9.6、分析
+2.10、模型修正
+2.10.1、节点铰接
+2.10.2、节点附加质量
+2.10.3、节点偏移
+2.10.4、单元附加质量
+2.10.5、单元节点偏心
+2.10.6、单元截面偏心
+2.10.7、单元抑制
+2.10.8、单元梁截面法向
+3、建立结构模型
+3.1、建筑结构模型
+3.1.1、特殊边
+3.1.2、梁柱撑构件
+3.1.3、墙构件
+3.1.4、楼板构件
+3.2、通用几何模型
+3.2.1、几何线或线构件
+3.2.2、几何面或面构件
+3.2.3、几何体或体构件
+4、条件查询(试验功能)
+4.1、查询实体
+4.1.1、材料查询
+4.1.2、截面查询
+4.1.3、节点查询
+4.1.4、单元查询
+4.2、查询方法
+4.2.1、查询结果
+4.2.2、并集
+4.2.3、交集
+4.2.4、差集
+4.2.5、等于条件
+4.2.6、大于条件
+4.2.7、大于等于条件
+4.2.8、小于条件
+4.2.9、小于等于条件
+4.2.10、求最小
+4.2.11、求最大
+4.2.12、单元对应的节点(仅NodeQuery支持)
+4.2.13、节点对应的单元(仅ElementQuery支持)
+三、附录
+1、枚举值
+MaterialType
+MaterialModel
+SectionType
+ShapeType
+ComponentType
+LineType
+SurfType
+SolidType
+ElementType
+LoadType
+FDof
+Dof
+LoadDistributionType
+LoadSubType
+WaterPressureType
+WaveType
+InertiaType
+BindingType
+DofMode
+CouplingType
+EmbededType
+ContactType
+ContactMethod
+ConnSectType
+ConnStiffType
+ConnDampType
+ConnFrictionType
+ConnFailType
+ConnLockType
+ConnCoordType
+ChangeType
+FixedType
+ElasSupportType
+IsolationBearingType
+PreStressType
+JointType
+OffsetType
+OffcenterType
+2、有限元模型
+梁
+壳
+实体
+网壳
+双曲抛物面
+3、结构模型
+开洞立方体
+圆柱圆锥
+简单结构
+一、概览
+1、简介
+PyPCAE是PKPM-CAE软件集成的基于Python的脚本式建模功能。用户可基于该功能通过编写脚本的方法便捷高效地进行参数化建模。 执行基于PyPCAE编写的脚本后，将生成可被软件解析的包括节点、单元、边界条件等在内的模型数据，并可被软件可视化地展示。
+
+二、使用
+1、导入模块
+进行参数化建模前，应首先导入编程过程中所需的模块(module)，以调用模块中定义的类、方法、变量。 在PyPCAE中，应首先按需导入pypcae.enums，pypcae.comp，pypcae.fem(或pypcae.stru)和math：
+
+代码	含义
+from pypcae.enums import *	导入PyPCAE中定义的枚举值
+from pypcae.comp import *	导入PyPCAE的comp模块
+from pypcae.fem import FemModel	若建立有限元模型，则导入FemModel
+from pypcae.stru import StruModel	若建立结构模型，则导入StruModel
+import math	如需进行数学运算，则导入math模块
+2、建立有限元模型
+2.1、材料
+Material(name: str, iType: int, iModel: int, E0: float, poisson: float, density: float)
+
+使用该类可创建固体力学材料。
+name为材料名称，应传入字符串；
+iType为材料类型，应使用enums中定义的MaterialType类，如MaterialType.Concrete；
+iModel为本构类型，应使用enums中定义的MaterialModel类，如MaterialModel.Elastic；
+E0为弹性模量；
+poisson为泊松比；
+density为密度。
+Material类可根据材料传入顺序依次为材料进行编号。
+Material类已预先定义了形参iType = MaterialType.Custom，iModel = MaterialModel.Elastic，E0 = 0.0，poisson = 0.0与density = 0.0，故定义材料时应至少传入形参name。
+
+2.2、截面
+Section(name: str, type: int, sub: list[dict{"type": int, "params": list[float], "props": list[float], "mid": int}], iKey: int)
+
+使用该类可创建截面。
+name为截面名称，应传入字符串；
+type为截面类型，应使用enums中定义的SectionType类，如SectionType.Solid；
+sub中，"type"为截面形状类型，应使用enums中定义的ShapeType类，如ShapeType.SOLID；"params"为截面参数；"props"为截面属性；"mid"为材料号；
+iKey为截面属性传入方法，若iKey为0，表示直接给定截面属性；若iKey为1，表示传入参数计算截面属性。
+Section类可根据截面传入顺序依次为截面进行编号。
+Section类已预先定义了形参type = SectionType.Solid，sub = None与iKey = 1，故定义截面时应至少传入形参name。
+
+截面参数的定义方法(若 iKey = 0)
+截面属性的定义方法(若 iKey = 1)
+定义mat与sec时可只给定形参name的值，在操作PKPM-CAE的过程中可赋予mat与sec的其余特性。
+
+2.3、节点
+首先根据建模对象的几何特征与节点之间的相对关系，确定模型各个节点在三维直角坐标系中的坐标。
+
+Node(x: float, y: float, z: float)
+
+使用该类可创建节点，将各个节点坐标分别传递到Node类中。
+x为该节点x坐标的值；
+y为该节点y坐标的值；
+z为该节点z坐标的值。
+Node类可根据节点传入顺序依次为节点进行编号。
+Node类未预先定义任何形参，故定义节点时应至少传入形参x，y与z。
+
+2.4、单元
+Element(nids: list[int], type: int, sid: int, normal)
+
+使用该类可创建单元
+nids为该单元所包含的节点编号；
+type为单元类型，应使用enums中定义的ElementType类，如ElementType.BeamEuler；
+sid为与单元相对应的截面的编号。
+Element类已预先定义了形参type = ElementType.Link，sid = -1与normal = None，故定义单元时应至少传入形参nids。
+
+2.5、集合
+2.5.1、节点集合
+Nset(name: str, ids: list[int])
+
+使用该类可创建节点集合。
+name为节点集合名称，应传入字符串；
+ids为节点号。
+Nset类已预先定义了形参ids = None，故定义节点集合时应至少传入形参name。
+
+2.5.2、单元集合
+Elset(name: str, ids: list[int])
+
+使用该类可创建单元集合
+name为单元集合名称，应传入字符串；
+ids为单元号。
+Elset类已预先定义形参ids = None，故定义单元集合时应至少传入形参name。
+
+2.5.3、接触单元
+Contactor(att: int, side=None: int, nids=None: list[int])
+
+使用该类可创建接触单元，接触单元需要从属于接触面才能生效。
+att为附着单元编号；
+side为对应的附着单元表面号，对于面单元正向为1反向为2，对于四面体单元编号从1到4，对于六面体单元从1到6；
+nids为接触单元节点号，当side缺省时nids用于确定side的值，对于面单元顺时针对应附着单元正向，体单元没有顺序要求。
+Contactor类已预先定义了形参side = None和nids = None，故定义接触单元时应至少传入形参att, side和nids必填其一。
+
+2.5.4、接触面(接触单元集合)
+ContactSet(name: str, contactors: list[Contactor])
+
+使用该类可创建接触面。
+name为接触面名称，应传入字符串；
+contactors为所包含的接触单元。
+ContactSet类已预先定义了形参contactors = None，故定义接触面时应至少传入形参name。
+
+2.6、支座
+2.6.1、固定支座
+Fixed(gnids: list[int], dof: list[int], type: int)
+
+使用该类可创建固定支座。
+gnids为节点号；
+dof为约束自由度；
+type为约束类型，应使用enums中定义的FixedType类，如FixedType.Default。
+Fixed类已预先定义了全部形参，即：gnids = None，dof = None与type = FixedType.Default。
+
+2.6.2、弹性支座
+ElasSupport(gnids: list[int], type: int, kx: float, ky: float, kz: float, vx: list[float], vz: list[float])
+
+使用该类可创建弹性支座。
+gnids为节点号；
+type为弹性支座类型，应使用enums中定义的ElasSupportType类，如ElasSupportType.Lateral；
+kx，ky，kz为弹簧刚度系数，
+vx为弹簧坐标系x轴方向余弦，
+vz为弹簧坐标系z轴方向余弦。
+ElasSupport类已预先定义了全部形参，即：gnids = None，type = ElasSupportType.Lateral，kx = 0，ky = 0，kz = 0，vx = None与vz = None。
+
+2.6.3、隔震支座
+IsolationBearing(gnids: list[int], type: int)
+
+使用该类可创建隔震支座。
+gnids为节点号；
+type为隔震支座类型，应使用enums中定义的IsolationBearingType类，如IsolationBearingType.General。
+IsolationBearing类已预先定义了全部形参，即：gnids = None与type = IsolationBearingType.General。
+
+2.6.4、主从约束
+DofSlave(slave: list[], master: list[list[]], coef: list[float])
+
+使用该类可创建主从约束。
+slave为自由度及对应源(从)节点号；
+master为自由度及对应靶(主)节点号；
+coef为从自由度方程系数。
+DofSlave类已预先定义了全部形参，即：slave = None，master = None与coef = None。
+
+2.6.5、标准约束
+ConstrEqua(dofEqua: list[list[]], coef: list[float])
+
+使用该类可创建标准约束。
+dofEqua为自由度及对应节点号；
+coef为常系数。
+ConstrEqua类已预先定义了全部形参，即：dofEqua = None与coef = None。
+
+2.7、相互作用
+2.7.1、绑定
+Binding(tarNodes: list[int], srcNodes: list[int], type: int, iKey: int, iTol=1, tol: float)
+
+使用该类可创建绑定相互作用。
+tarNodes为靶(主)节点或节点集合号；
+srcNodes为源(从)节点或节点集合号；
+type为广义连接子类型(绑定类型)，应使用enums中定义的BindingType类，如BindingType.NodeToNode；
+iKey为自由度模式，应使用enums中定义的DofMode类，如DofMode.Both；
+iTol为绑定容差模式，-1为强制绑定, 0为自动, 1为自定义；
+tol为允许误差距离(绑定容差)，负值为内部自动确定。
+Binding类已预先定义了全部形参，即：tarNodes = None，srcNodes = None，type = BindingType.NodeToNode，iKey = DofMode.Both与tol = -1。
+
+2.7.2、耦合
+Coupling(tarNode: int, srcNodes: list[int], type: int, iKey: int, iDofs: int)
+
+使用该类可创建耦合相互作用。
+tarNode为靶(主)节点号；
+srcNodes为源(从)节点或节点集合号；
+type为耦合类型，应使用enums中定义的CouplingType类，如CouplingType.Rigid；
+iKey为自由度模式，应使用enums中定义的DofMode类，如DofMode.Both；
+iDofs为指定自由度。
+Coupling类已预先定义了全部形参，即：tarNodes = None，srcNodes = None，type = CouplingType.Rigid，iKey = DofMode.Both与iDofs = None。
+
+2.7.3、嵌入
+Embeded(tarElems: list[int], srcElems: list[int], type: int, iKey: int, tol: float)
+
+使用该类可创建嵌入相互作用。
+tarElems为靶(主)单元或单元集合号；
+srcElems为源(从)单元或单元集合号；
+type为嵌入类型，应使用enums中定义的EmbededType类，如EmbededType.NodeToElem；
+iKey为自由度模式，应使用enums中定义的DofMode类，如DofMode.Both；
+tol为允许误差距离(嵌入容差)，暂时保留。
+Embeded类已预先定义了全部形参，即：tarElems = None，srcElems = None，type = EmbededType.NodeToElem，iKey = DofMode.Both与tol = -1。
+
+2.7.4、接触对
+ContactPair(tarElems: list[int], srcElems: list[int], type: int, iMethod: int, penalty: float, slipTol: float, mu: float)
+
+使用该类可创建接触对相互作用。
+tarElems为靶(主)面接触面号；
+srcElems为源(从)面接触面号；
+type为接触类型，应使用enums中定义的ContactType类，如ContactType.ElasToElas；
+iMethod为离散类型(接触计算方法)，应使用enums中定义的ContactMethod类，如ContactMethod.NodeToSurf；
+penalty为罚系数；
+slipTol为作用间隙；
+mu为摩擦系数。
+ContactPair类已预先定义了全部形参，即：tarElems = None，srcElems = None，type = ContactType.ElasToElas，iMethod = ContactMethod.NodeToSurf，penalty = -1，slipTol = 0与mu = 0。
+
+2.7.5、连接器截面
+ConnectorSection(name: str, iType: int, keyStiff: int, consElas: float, keyDamp: int, keyFriction: int, keyFail: int, keyLock: int)
+
+使用该类可创建连接器截面。
+name为连接器截面名称，应传入字符串；
+iType为连接器截面类型，应使用enums中定义的ConnSectType类，如ConnSectType.Translation；
+keyStiff为刚度模型本构类型，应使用enums中定义的ConnStiffType类，如ConnStiffType.Linear；
+consElas为常刚度；
+keyDamp为阻尼模型类型，应使用enums中定义的ConnDampType类，如ConnDampType.Off；
+keyFriction为摩擦类型，应使用enums中定义的ConnFrictionType类，如ConnFrictionType.Off；
+keyFail为失效控制类型，应使用enums中定义的ConnFailType类，如ConnFailType.Off；
+keyLock为阻止控制类型，应使用enums中定义的ConnLockType类，如ConnLockType.Off。
+ConnectorSection类已预先定义了形参iType = ConnSectType.Translation，keyStiff = ConnStiffType.Linear，consElas = 0，keyDamp = ConnDampType.Off，keyFriction = ConnFrictionType.Off，keyFail = ConnFailType.Off与keyLock = ConnLockType.Off，故定义连接器截面时应至少传入形参name。
+
+2.7.6、连接器
+Connector(start: int, end: int, iDofs: list[int], iSects: list[int], iCoord: int, vy: list[float], vx: list[float])
+
+使用该类可创建连接器。
+start与end分别为开始节点号与结束节点号；
+iDofs为自由度号；
+iSects为各自由度对应的连接器截面号；
+iCoord为坐标系类型，应使用enums中定义的ConnCoordType类，如ConnCoordType.Auto；
+iCoord = [[vy], [vx]]为连接单元局部坐标系，1个表示局部y向，2个表示局部x和y向。
+Connector类已预先定义了全部形参，即：start = None，end = None，iDofs = None，iSects = None，iCoord = ConnCoordType.Auto，vy = None与vx = None。
+
+2.8、荷载
+LoadCase(name: str)
+
+使用该类可为模型创建荷载。
+name为荷载名称，应传入字符串。
+LoadCase(name: str)类可通过add()函数添加具体的荷载，如：
+
+LoadCase("test").add(Cload(gnids: list[int], dof: list[int], value: list[float]))
+
+2.8.1、节点荷载
+Cload(gnids: list[int], dof: list[int], value: list[float])
+
+使用该类可创建节点荷载。
+gnids为作用位置节点号；
+dof为自由度(荷载施加方向)，应使用enums中定义的FDof类，如FDof.Fy；
+value为与荷载施加方向相对应的节点荷载的值。
+Cload类已预先定义了全部形参，即：gnids = None，dof = None与value = None。
+
+2.8.2、节点位移
+Cdisp(gnids: list[int], dof: list[int], value: list[float])
+
+使用该类可创建节点位移。
+gnids为作用位置节点号；
+dof为节点位移自由度，应使用enums中定义的Dof类，如Dof.Ux，此处不适用于Dof.All和Dof.Uxyz；
+value为与自由度相对应的节点位移的值。
+Cdisp类已预先定义了全部形参，即：gnids = None，dof = None与value = None。
+
+2.8.3、线(单元/构件)荷载
+Elload(geids: list[int], type: int, subType: int, value: list[float], iCoord: int, coord: list[float], dir: list[int])
+
+使用该类可创建线(单元/构件)荷载。
+geids为作用位置(单元/构件)号；
+type为荷载分布类型，应使用enums中定义的LoadDistributionType类，如LoadDistributionType.Concentrated；
+subType为荷载作用类型，应使用enums中定义的LoadSubType类，如LoadSubType.Force；
+value为线(单元/构件)荷载值；
+iCoord为坐标系类型，若该值为0则表示总体坐标系，若该值为1则表示单元局部坐标系；
+coord为荷载相对位置；
+dir为荷载方向矢量。
+Elload类已预先定义了全部形参，即：geids = None，type = LoadDistributionType.Uniform，subType = LoadSubType.Force，value = None，iCoord = 0，coord = None与dir=None。
+
+2.8.4、面(单元/构件)荷载
+Esload(geids: list[int], type: int, subType: int, value: list[float], iCoord: int, coord: list[float], dir: list[int])
+
+使用该类可创建面(单元/构件)荷载。
+geids为作用位置(单元/构件)号；
+type为荷载分布类型，应使用enums中定义的LoadDistributionType类，如LoadDistributionType.Concentrated；
+subType为荷载作用类型，应使用enums中定义的LoadSubType类，如LoadSubType.Force；
+value为面(单元/构件)荷载值；
+iCoord为坐标系类型，若该值为0则表示总体坐标系，若该值为1则表示单元局部坐标系；
+coord为荷载相对位置；
+dir为荷载方向矢量。
+Esload类已预先定义了全部形参，即：geids = None，type = LoadDistributionType.Uniform，subType = LoadSubType.Force，value = None，iCoord = 0，coord = None与dir = None。
+
+2.8.5、面(单元/构件)边线荷载
+Eslload(esides: tumple, type: int, subType: int, value: list[float], iCoord: int, coord: list[float], dir: list[int])
+
+使用该类可创建面(单元/构件)边线荷载。
+esides为包含geids: list[int](作用位置(单元/构件)号)与sides: list[int](边号)的元组；
+type为荷载分布类型，应使用enums中定义的LoadDistributionType类，如LoadDistributionType.Concentrated；
+subType为荷载作用类型，应使用enums中定义的LoadSubType类，如LoadSubType.Force；
+value为面(单元/构件)边线荷载值；
+iCoord为坐标系类型，若该值为0则表示总体坐标系，若该值为1则表示单元局部坐标系；
+coord为荷载相对位置；
+dir为荷载方向矢量。
+Eslload类已预先定义了全部形参，即：esides = None，type = LoadDistributionType.Uniform，subType = LoadSubType.Force，value = None，iCoord = 0，coord = None与dir = None。
+
+2.8.6、体荷载
+Ebload(geids: list[int], value: float, iCoord: int, dir: list[int])
+
+使用该类可创建体荷载。
+geids为作用位置单元号；
+value为体荷载值；
+iCoord为坐标系类型，若该值为0则表示总体坐标系，若该值为1则表示单元局部坐标系；
+dir为荷载方向矢量。
+Ebload类已预先定义了全部形参，即：geids = None，value = 0，iCoord = 0与dir = None。
+
+2.8.7、体(单元/构件)表面荷载
+Ebsload(esides: tumple, value: float, iCoord: int, dir: list[int])
+
+使用该类可创建体(单元/构件)表面荷载。
+esides为包含geids: list[int](作用位置(单元/构件)号)与sides: list[int](表面号)的元组；
+value为体(单元/构件)表面荷载；
+iCoord为坐标系类型，若该值为0则表示总体坐标系，若该值为1则表示单元局部坐标系；
+dir为荷载方向矢量。
+Ebsload类已预先定义了全部形参，即：esides = None，value = 0，iCoord = 0与dir=None。
+
+2.8.8、静水压力
+Wpload(esides: tumple, type: int, value: float, h0: float, h: float)
+
+使用该类可创建静水压力。
+esides为包含geids: list[int](作用位置(单元/构件)号)与sides: list[int](实体单元面号)的元组；
+type为作用对象类型，应使用enums中定义的WaterPressureType类，如WaterPressureType.SolidSurface；
+value为参考点水压力；
+h0为水平面坐标；
+h为参考点坐标。
+Wpload类已预先定义了全部形参，即：esides = None，type = WaterPressureType.SolidSurface，value = 0，h0 = 0与h = 0。
+
+2.8.9、动力波
+Wload(gnids: list[int], wType: int, value: float, timeHist:list[list[]], dir: list[int])
+
+使用该类可创建动力波。
+gnids为作用位置节点号；
+wType为作用类型，应使用enums中定义的WaveType类，如WaveType.Acceleration；
+value为荷载峰值；
+timeHist为时程；
+dir为荷载方向矢量。
+Wload类已预先定义了全部形参，即：gnids = None，wType = WaveType.Acceleration，value = 0，timeHist = None与dir = None。
+
+2.8.10、节点温度
+Ctem(gnids: list[int], value: float)
+
+使用该类可创建节点温度荷载。
+gnids为作用位置节点号；
+value为温度值。
+Ctem类已预先定义了全部形参，即：gnids = None与value = 0。
+
+2.9、分析
+2.9.1、单元杀死激活
+Change(type=ChangeType.Add: int, geids = None)
+
+使用该类可创建荷单元杀死激活。
+type为单元生死类型，应使用enums中定义的ChangeType类，如ChangeType.Add；
+geids为作用单元。
+
+2.9.2、工况组合
+LoadCaseCombine(lid: int, coef = 1.0, PSDCurve = -1)
+
+使用该类可创建工况组合。
+lid为工况编号，为必填；
+coef为组合系数，默认为1.0；
+PSDCurve为功率谱密度曲线编号（仅用于随机振动分析中）。
+
+2.9.3、荷载步
+Step(name: str, changes=None: list[Change], loadCases=None: list[LoadCaseCombine])
+
+使用该类可创建荷载步。
+name为荷载步名称，应传入字符串；
+changes为该荷载步的单元生死；
+loadCases为该荷载步的组合工况
+Step类已预先定义了形参changes = None与loadCases = None，故定义荷载步时应至少传入形参name。
+
+2.9.4、预应力/应变
+PreStress(geids: list[int], type: int, value: float)
+
+使用该类可创建预应力/应变。
+geids为预应力/应变作用位置单元号；
+type为作用类型，应使用enums中定义的PreStressType类，如PreStressType.Stress；
+value为预应力/应变值。
+PreStress类已预先定义了全部形参，即：geids = None，type = PreStressType.Stress与value = 0。
+
+2.9.5、初始速度
+InitialVelo(gnids: list[int], velo: list[float])
+
+使用该类可创建初始速度。
+gnids为作用位置节点号；
+velo为速度矢量。
+InitialVelo类已预先定义了全部形参，即：gnids = None与velo = None。
+
+2.9.6、随机振动分析相关
+SelfSpectrum(name: str, curves :list[list[float]], iType=0 :int, cType=0: int, iPropagation=0: int, speed=None: list[float], Rmax=0: float, Rmin=0: float)
+
+使用该类可创建PSD自谱曲线。
+name为曲线名；
+curves为曲线[ [频率点], [频率点对应的值]]；
+iType为PSD自谱曲线的类型（0,位移谱;1,速度谱;2,加速度谱;3,力谱;4,应力谱）；
+cType为相关类型 (0: 完全不相关 1: 完全相关 3: 空间相关)；
+iPropagation为是否考虑自谱曲线的行波效应(0表示不考虑, 1表示考虑)，某自谱曲线考虑行波效应则不能定义互谱曲线；
+speed为传播速度传播速度[vx,vy,vz],仅在考虑行波效应时有效；
+Rmax为最大部分相关范围，仅在空间相关（cType=3）时有效；
+Rmin为最大完全相关范围，仅在空间相关（cType=3）时有效。
+
+CrossSpectrum(name: str, iPSD: int, iPSD2: int, curves :list[list[float]], iComplex=None: int)
+
+使用该类可创建PSD互谱曲线。
+name为曲线名；
+iPSD为PSD曲线的编号；
+iPSD2为PSD曲线2的编号；
+curves为曲线[ [频率点], [频率点对应的实部值], [频率点对应的虚部值]]；
+iComplex为该互谱曲线是否存在虚部值(0表示不存在, 1表示存在, 默认为0)；
+
+PSDCurve(selfSpectrum=None: list[SelfSpectrum], crossSpectrum=None: list[CrossSpectrum])
+
+使用该类存放输入的PSD曲线。
+selfSpectrum输入自谱曲线；
+crossSpectrum输入互谱曲线。
+
+2.9.6、分析
+Analy(name: str, steps=None: list[Step], preStresses=None: list[PreStress], initialVelos=None: list[InitialVelo], psdCurve=None: list[PSDCurve])
+
+使用该类可分析。
+name为分析名称，应传入字符串；
+steps为该分析的载荷步；
+preStresses为该分析的预应力/应变；
+initialVelos为该分析的初速度；
+psdCurve=None为该分析所施加的功率谱密度曲线；
+Analy类已预先定义了形参steps = None、preStresses = None、initialVelos = None与psdCurve = None，故定义分析时应至少传入形参name。
+
+2.10、模型修正
+2.10.1、节点铰接
+NodeJoint(gnids: list[int], type: int, geids: list[int])
+
+使用该类可创建节点铰接。
+gnids为作用位置节点号；
+type为铰接类型，应使用enums中定义的JointType类，如JointType.Sphere；
+geids为作用位置单元号。
+NodeJoint类已预先定义了全部形参，即：gnids = None，type = JointType.Sphere与geids = None。
+
+2.10.2、节点附加质量
+NodeMass(gnids: list[int], mass: float)
+
+使用该类可创建节点附加质量。
+gnids为作用位置节点号；
+mass为质量值。
+NodeMass类已预先定义了全部形参，即：gnids = None与mass = 0。
+
+2.10.3、节点偏移
+NodeOffset(gnids: list[int], type: int, offset: list[float], sita: float, axisStart: list[float], axisEnd: list[float])
+
+使用该类可创建节点偏移。
+gnids为作用位置节点号；
+type为偏移类型，应使用enums中定义的OffsetType类，如OffsetType.Translation；
+offset为偏移量；
+sita为旋转角；
+axisStart为转轴起点；
+axisEnd为转轴终点。
+NodeOffset类已预先定义了全部形参，即：gnids = None，type = OffsetType.Translation，offset = None，sita = 0，axisStart = None与axisEnd = None。
+
+2.10.4、单元附加质量
+ElemMass(geids: list[int], mass: float)
+
+使用该类可创建单元附加质量。
+geids为作用位置单元号；
+mass为质量值。
+ElemMass类已预先定义了全部形参，即：geids=None与mass = 0。
+
+2.10.5、单元节点偏心
+ElemNodeOffcenter(geid: int, offCenter: list[list[float]])
+
+使用该类可创建单元节点偏心。
+geid为作用单元号；
+offCenter为单元各节点x、y、z三个方向的偏心值。
+ElemNodeOffcenter类已预先定义了形参offCenter = None，故定义单元节点偏心时应至少传入形参geid。
+
+2.10.6、单元截面偏心
+ElemSectOffcenter(geids: list[int], type: int, value: list[int])
+
+使用该类可创建单元节点偏心。
+geids为作用位置单元号；
+type为偏心类型，应使用enums中定义的OffcenterType类，如OffcenterType.Beam；
+value为偏心值。
+ElemSectOffcenter类已预先定义了全部形参，即：geids = None，type = OffcenterType.Beam与value = None。
+
+2.10.7、单元抑制
+ElemSuppress(geids: list[int])
+
+使用该类可创建单元抑制。
+geids为作用位置单元号。
+ElemSuppress类未预先定义形参，故定义单元抑制时应至少传入形参geids。
+
+2.10.8、单元梁截面法向
+ElemNormal(normal: list[float], geids: list[int])
+
+使用该类可创建单元梁截面法向。
+normal为法向量；
+geids为作用位置单元号。
+ElemNormal类已预先定义了全部形参，即：normal = None与geids = None。
+
+3、建立结构模型
+结构模型的 材料 、 截面 、 节点 的建模方法与有限元相同 , 所不同之处是以 构件 取代了 单元 。 结构模型参数化建模支持两种模式, 即 建筑结构模型 和 通用几何模型 。
+
+3.1、建筑结构模型
+3.1.1、特殊边
+Edge(id=0, circleCenter=None: list[float], middles=None: list[int])
+
+使用该类可创建 特殊边 作为建立结构构件的辅助数据结构, 所谓 特殊边 是指该边为圆弧或者有中间节点的情况
+id 为该边在构件所有边中的编号, 从0开始;
+circleCenter 为圆弧边的圆心, 当且仅当改边为圆弧时 ;
+middles 为中间点的节点编号。
+
+3.1.2、梁柱撑构件
+BeamColumn(nids: list[int], iMark=ComponentType.BEAM, sid=-1,  normal=None: list[float], edge=None: Edge)
+
+使用该类可创建 梁柱撑等一维构件
+nids 为该构件所包含的节点编号;
+iMark 为 构件细分类型 , 应使用 enums 中定义的 ComponentType 类，如 ComponentType.BEAM ;
+sid 为与构件相对应的截面的编号;
+normal 为构件截面Y方向的方向向量;
+edge 为特殊边属性, 当且仅当该一维构件为圆弧或者有中间节点时需要传入。
+BeamColumn 类已预先定义了形参 type = ComponentType.BEAM , sid = -1 、 normal = None 与 edge = None , 故定义构件时应至少传入形参 nids 。
+
+3.1.3、墙构件
+Wall(nids: list[int], sid=-1, circleCenter=None: list[float], caveNids=None: list[int])
+
+使用该类可创建 墙构件
+nids 为该构件所包含的四个角点的节点编号, 需要符合左下角点、右下角点、右上角点、左上角点的顺序;
+sid 为与构件相对应的截面的编号;
+circleCenter 底边圆弧中心, 当且仅当为圆弧墙时需要传入;
+caveNids 为墙洞的四个角点的节点编号, 需要符合左下角点、右下角点、右上角点、左上角点的顺序, 可与墙的节点重合, 当且仅当该构件开洞时需要传入。
+Wall 类已预先定义了形参 sid = -1 、 circleCenter = None 与 caveNids = None , 故定义构件时应至少传入形参 nids 。
+
+3.1.4、楼板构件
+Plate(nids: list[int], sid=-1, edges=None: list[Edge])
+
+使用该类可创建 楼板构件
+nids 为该构件所包含的节点编号, 需要符合右手螺旋向上的顺序规则;
+sid 为与构件相对应的截面的编号;
+edges 为特殊边属性, 当且仅当有的板边为圆弧或有中间节点时需要传入;
+Plate 类已预先定义了形参 sid = -1 与 edges = None , 故定义构件时应至少传入形参 nids 。
+
+3.2、通用几何模型
+3.2.1、几何线或线构件
+Line(start: int, end: int, center=None: int, kp=None: int, type=LineType.Straight, sid=-1, normal=None: list[float])
+
+使用该类可创建 几何线或线构件
+start 为该构件起点编号;
+end 为该构件终点编号;
+center 为该构件圆心点编号, center 与 kp 当且仅当几何线为圆弧线时需要传入;
+kp 为该构件方向点编号, 若为-1则表示z向竖直向上, 若为-2则表示z向竖直向下;
+type 为 几何线类型 , 应使用 enums 中定义的 LineType 类，如 LineType.Straight ;
+sid 为与构件相对应的截面的编号;
+normal 为构件截面Y方向的方向向量;
+Line 类已预先定义了形参 type = LineType.Straight , sid = -1 与 normal = None , 故定义构件时应至少传入形参 start 、 end 。
+
+3.2.2、几何面或面构件
+Surf(outer: list[int], inners=None: list[list[int]], type=SurfType.Plane, bottom=-1, top=-1, sid=-1)
+
+使用该类可创建 几何面或面构件
+outer 为该构件外边界线的构件编号;
+inners 为该构件内边界线(开洞)的构件编号;
+type 为 几何面类型 , 应使用 enums 中定义的 SurfType 类，如 SurfType.Plane ;
+bottom 当该构件为圆柱圆台或圆锥面时为底边线构件的编号;
+top 当该构件为圆柱圆台面时为顶边线构件的编号, 当该构件为圆锥面时为顶点编号;
+sid 为与构件相对应的截面的编号;
+Surf 类已预先定义了形参 type = SurfType.Plane 与 sid = -1 , 故定义构件时应至少传入形参 outer 。
+
+3.2.3、几何体或体构件
+Solid(outer: list[int], inners=None: list[list[int]], type=SolidType.General, sid=-1)
+
+使用该类可创建 几何体或体构件
+outer 为该构件外边界线的构件编号;
+inners 为该构件内边界线(空腔)的构件编号;
+type 为 几何体类型 , 应使用 enums 中定义的 SolidType 类，如 SolidType.General ;
+sid 为与构件相对应的截面的编号;
+Solid 类已预先定义了形参 type = SolidType.General 与 sid = -1 , 故定义构件时应至少传入形参 outer 。
+
+4、条件查询(试验功能)
+通过一定的查询条件(如属性编号、坐标范围、名称)进行节点、单元、材料、截面等元素信息的查询，并将查询结果聚合为一个临时集合，并支持将多种查询条件的结果进行并、交、差操作。
+具体由查询实体(继承于BaseQuery类)和查询方法来组合实现。
+
+4.1、查询实体
+4.1.1、材料查询
+MaterialQuery(scope=None: set[Material]|list[Material]|list[int])
+
+使用该类可进行 材料 的查询
+scope 为本次查询所基于的元素范围或元素的id范围, 默认为所有元素。
+
+4.1.2、截面查询
+SectionQuery(scope=None: set[Section]|list[Section]|list[int])
+
+使用该类可进行 截面 的查询
+scope 为本次查询所基于的元素范围或元素的id范围, 默认为所有元素。
+
+4.1.3、节点查询
+NodeQuery(scope=None: set[Node]|list[Node]|list[int])
+
+使用该类可进行 节点 的查询
+scope 为本次查询所基于的元素范围或元素的id范围, 默认为所有元素。
+
+4.1.4、单元查询
+ElemQuery(scope=None: set[Element]|list[Element]|list[int])
+
+使用该类可进行 单元 的查询
+scope 为本次查询所基于的元素范围或元素的id范围, 默认为所有元素。
+
+4.2、查询方法
+4.2.1、查询结果
+单个元素-one 多个元素-items 单个元素编号-id 多个元素编号-ids
+
+4.2.2、并集
+union(query: BaseQuery)
+
+使用该方法可以将现有查询结果与query进行 求并集 操作
+query 为另一个查询实体。
+
+4.2.3、交集
+intersection(query: BaseQuery)
+
+使用该方法可以将现有查询结果与query进行 求交集 操作
+query 为另一个查询实体。
+
+4.2.4、差集
+difference(query: BaseQuery)
+
+使用该方法可以将现有查询结果与query进行 求差集 操作
+query 为另一个查询实体。
+
+4.2.5、等于条件
+eq(k: str, v, tol=None)
+
+使用该方法可以将现有查询结果基础上新增一个 属性k等于v容差范围为tol 的筛选条件
+k 为属性名;
+v 为属性值;
+tol 为容差范围。
+
+4.2.6、大于条件
+gt(k: str, v, tol=None)
+
+使用该方法可以将现有查询结果基础上新增一个 属性k大于v(容差范围为tol) 的筛选条件
+
+4.2.7、大于等于条件
+ge(k: str, v, tol=None)
+
+使用该方法可以将现有查询结果基础上新增一个 属性k大于等于v(容差范围为tol) 的筛选条件
+
+4.2.8、小于条件
+lt(k: str, v, tol=None)
+
+使用该方法可以将现有查询结果基础上新增一个 属性k小于v(容差范围为tol) 的筛选条件
+
+4.2.9、小于等于条件
+le(k: str, v, tol=None)
+
+使用该方法可以将现有查询结果基础上新增一个 属性k小于等于v(容差范围为tol) 的筛选条件
+
+4.2.10、求最小
+min(k: str, tol=None)
+
+使用该方法可以将现有查询结果基础上查询 属性k最小值对应的元素(容差范围为tol) 的筛选条件
+k 为属性名;
+tol 为容差范围, 即当属性k的最小值为vmin时，属性k值在[vmin-tol, vmin+tl]的范围都会被选中。
+
+4.2.11、求最大
+max(k: str, tol=None)
+
+使用该方法可以将现有查询结果基础上查询 属性k最大值对应的元素(容差范围为tol) 的筛选条件
+
+4.2.12、单元对应的节点(仅NodeQuery支持)
+elems(elems： ElementQuery|list[Element]|list[int])
+
+使用该方法可以查询 elems所包括的所有单元的节点
+elems 可以为一个ElementQuery或单元元素数组或单元编号数组。
+
+4.2.13、节点对应的单元(仅ElementQuery支持)
+nodes(nodes： NodeQuery|list[Node]|list[int])
+
+使用该方法可以查询 nodes所包括的所有节点所从属的单元
+nodes 可以为一个NodeQuery或节点元素数组或节点编号数组。
+
+三、附录
+1、枚举值
+MaterialType
+MaterialType (材料类型) 枚举值
+MaterialModel
+MaterialModel (本构类型) 枚举值
+SectionType
+SectionType (截面类型) 枚举值
+ShapeType
+ShapeType (截面形状类型) 枚举值
+ComponentType
+ComponentType (构件类型) 枚举值
+LineType
+LineType (几何线类型) 枚举值
+SurfType
+SurfType (几何面类型) 枚举值
+SolidType
+SolidType (几何体类型) 枚举值
+ElementType
+ElementType (单元类型) 枚举值
+LoadType
+LoadType (荷载类型) 枚举值
+FDof
+FDof (荷载施加方向) 枚举值
+Dof
+Dof (自由度) 枚举值
+LoadDistributionType
+LoadDistributionType (荷载分布类型) 枚举值
+LoadSubType
+LoadSubType (荷载作用类型) 枚举值
+WaterPressureType
+WaterPressureType (静水压力作用对象类型) 枚举值
+WaveType
+WaveType (动力波作用类型) 枚举值
+InertiaType
+InertiaType (惯性力作用类型) 枚举值
+BindingType
+BindingType (绑定类型) 枚举值
+DofMode
+DofMode (自由度模式) 枚举值
+CouplingType
+CouplingType (耦合类型) 枚举值
+EmbededType
+EmbededType (嵌入类型) 枚举值
+ContactType
+ContactType (接触类型) 枚举值
+ContactMethod
+ContactMethod (离散类型) 枚举值
+ConnSectType
+ConnSectType (连接器截面类型) 枚举值
+ConnStiffType
+ConnStiffType (刚度模型本构类型) 枚举值
+ConnDampType
+ConnDampType (阻尼模型类型) 枚举值
+ConnFrictionType
+ConnFrictionType (摩擦类型) 枚举值
+ConnFailType
+ConnFailType (失效控制类型) 枚举值
+ConnLockType
+ConnLockType (阻止控制类型) 枚举值
+ConnCoordType
+ConnCoordType (坐标系类型) 枚举值
+ChangeType
+ChangeType (单元杀死激活类型) 枚举值
+FixedType
+FixedType (约束类型) 枚举值
+ElasSupportType
+ElasSupportType (弹性支座类型) 枚举值
+IsolationBearingType
+IsolationBearingType (隔震支座类型) 枚举值
+PreStressType
+PreStressType (作用类型) 枚举值
+JointType
+JointType (铰接类型) 枚举值
+OffsetType
+OffsetType (偏移类型) 枚举值
+OffcenterType
+OffcenterType (偏心类型) 枚举值
+2、有限元模型
+梁
+  Python代码
+
+from pypcae.enums import *
+from pypcae.comp import *
+from pypcae.fem import FemModel
+
+clc()
+mat = Material("test", E0=1, poisson=0, density=1)
+sec = Section("test", SectionType.Line, Arbitrary(mid=mat.id, area=1, Ix=1, Iy=1, Iz=1))
+nods = [Node(0, 0, 0), Node(0.5, 0, 0), Node(1, 0, 0)]
+e1 = Element(nids=[nods[0].id, nods[1].id], sid=sec.id, type=ElementType.BeamEuler)
+e2 = Element(nids=[nods[1].id, nods[2].id], sid=sec.id, type=ElementType.BeamEuler)
+Elset("test", [e1.id, e2.id])
+
+Fixed(nods[0].id, Dof.All)
+LoadCase("test").add(Cload(FDof.Fy, -1, nods[2].id))
+
+FemModel.toViewer()
+  效果
+
+logo
+
+壳
+  代码
+
+from pypcae.enums import *
+from pypcae.comp import *
+from pypcae.fem import FemModel
+
+clc()
+mat = Material("test", E0=1, poisson=0, density=1)
+sec = Section("test", SectionType.Surface, SingleLayer(mid=mat.id, t=1.0))
+
+l = 1.0
+b = 1.0
+n = 20
+m = 20
+nods = []
+for i in range(n + 1):
+    for j in range(m + 1):
+        nods.append(Node(i * l / n, j * b / m, 0))
+eleset = []
+for i in range(n):
+    for j in range(m):
+        e = Element(nids=[nods[(m + 1) * i + j].id, nods[(m + 1) * (i + 1) + j].id, nods[(m + 1) * (i + 1) + j + 1].id,
+                          nods[(m + 1) * i + j + 1].id], type=ElementType.ShellAssembled, sid=sec.id)
+        eleset.append(e.id)
+Elset("test", eleset)
+for j in range(m + 1):
+    Fixed( nods[j].id, Dof.All)
+loadCase = LoadCase("test")
+for j in range(m):
+    loadCase.add(Cload(FDof.Fz, -1.0 / m / 2, nods[(m + 1) * n + j].id))
+    loadCase.add(Cload(FDof.Fz, -1.0 / m / 2, nods[(m + 1) * n + j + 1].id))
+step = Step("test")
+step.add(LoadCaseCombine(loadCase.id, 1.0))
+analy = Analy("test")
+analy.add(step)
+
+FemModel.toViewer()
+  效果
+
+logo
+
+实体
+  Python代码
+
+from pypcae.comp import *
+from pypcae.fem import FemModel
+
+clc()
+mat = Material("test-mat", E0=1, poisson=0, density=1)
+sec = Section("test-sect", SectionType.Solid, SolidSect(mat.id))
+
+l, b, h = 1.0, 1.0, 1.0
+n = 8
+N = n + 1
+NN = (n + 1) * (n + 1)
+
+nset = Nset("all")
+cload_nset = Nset("cload")
+for i in range(N):
+    for j in range(N):
+        for k in range(N):
+            node = Node(i * l / n, j * b / n, k * h / n)
+            if k == 0:
+                Fixed(node.id, Dof.Uxyz)
+            nset.add(node.id)
+            if j == 0:
+                cload_nset.add(node.id)
+
+elset = Elset("all")
+bsload_esides = []
+for i in range(n):
+    for j in range(n):
+        for k in range(n):
+            e = Element([nset.ids[i * NN + j * N + k], nset.ids[i * NN + (j + 1) * N + k],
+                         nset.ids[i * NN + (j + 1) * N + k + 1], nset.ids[i * NN + j * N + k + 1],
+                         nset.ids[(i + 1) * NN + j * N + k], nset.ids[(i + 1) * NN + (j + 1) * N + k],
+                         nset.ids[(i + 1) * NN + (j + 1) * N + k + 1], nset.ids[(i + 1) * NN + j * N + k + 1]],
+                        type=ElementType.Solid, sid=sec.id)
+            elset.add(e.id)
+            if k == n - 1:
+                bsload_esides.append((e.id, 5))
+
+loadCase = LoadCase("test-loadcase")
+loadCase.add(Cload(nset.id, dof=FDof.Fy, value=0.5)).add(Ebsload(bsload_esides, value=1, dir=[0, 0, -1]))
+Analy("test-analy").add(Step("test-step").add(LoadCaseCombine(loadCase.id, 1.0)))
+
+FemModel.toViewer()
+  效果
+
+logo
+
+网壳
+  代码
+
+from pypcae.enums import *
+from pypcae.comp import *
+from pypcae.fem import FemModel
+import math
+
+clc()
+mat = Material("test")
+sec = Section("test", SectionType.Line, Circle(mat.id, 0.2))
+
+a, b, f = 30, 15, 7
+Kn, Kx, h0 = 10, 10, 50
+
+nodes = list()
+nodes.append([Node(0, 0, f + h0).id])
+for i in range(1, Kx + 1):
+    t = 1 - i * (i + 1) / (Kx * (Kx + 1))
+    z = f * t
+    c = math.sqrt(1 - z * z / (f * f))
+    thet = 0
+    nodes.append([])
+    while thet < 360:
+        x = a * c * math.cos(thet * math.pi / 180)
+        y = b * c * math.sin(thet * math.pi / 180)
+        node = Node(x, y, z + h0)
+        nodes[-1].append(node.id)
+        thet += 360 / (Kn * i)
+        if i == Kx:
+            Fixed( node.id, Dof.All)
+
+links = list()
+for m in range(1, Kx + 1):
+    for n in range(Kn * m):
+        links.append(Element(nids=[nodes[m][n], nodes[m][(n + 1) % (Kn * m)]]))
+for m in range(Kn):
+    links.append(Element(nids=[nodes[0][0], nodes[1][m]]))
+for rib in range(Kn):
+    for m in range(1, Kx):
+        links.append(Element(nids=[nodes[m][rib * m], nodes[m + 1][rib * (m + 1)]]))
+        links.append(Element(nids=[nodes[m][rib * m], nodes[m + 1][rib * (m + 1) - 1]]))
+        links.append(Element(nids=[nodes[m][rib * m], nodes[m + 1][rib * (m + 1) + 1]]))
+for m in range(2, Kx):
+    for n in range(Kn * m):
+        if n % m != 0:
+            links.append(Element(nids=[nodes[m][n], nodes[m + 1][int(n + n / m)]]))
+            links.append(Element(nids=[nodes[m][n], nodes[m + 1][int(n + n / m + 1)]]))
+
+for link in links:
+    link.sid = sec.id
+    link.dim = 1
+    link.tid = ElementType.Link
+
+FemModel.toViewer()
+  效果
+
+logo
+
+双曲抛物面
+  Python代码
+
+from pypcae.enums import *
+from pypcae.comp import *
+from pypcae.fem import FemModel
+import math
+
+clc()
+wx0, wx1, wy, wz0, wz1 = 52, 87, 52, 43, 73
+yn, zn = 36, 22
+center = [0, 0, 0]
+paraCache = {}
+tol = 1e-3
+
+
+def parabolaBottom(y):
+    a = (wz1 - wz0) / (wy / 2) ** 2
+    x, z = center[0], center[1] - a * y ** 2
+    return [x, y, z]
+
+
+def parabolaTop(y):
+    a = 0.5 * (wx1 - wx0) / (wy / 2) ** 2
+    x, z = center[0] + wx0 / 2 + a * y ** 2, center[2] + wz0
+    return [x, y, z]
+
+
+def parabola(y, z):
+    if y not in paraCache:
+        paraSolve(y)
+    a, b = paraCache[y]["a"], paraCache[y]["b"]
+    x = math.sqrt((z - b) / a)
+    return [x, y, z]
+
+
+def paraSolve(y):
+    top, bottom = parabolaTop(y), parabolaBottom(y)
+    paraCache[y] = {"a": (top[2] - bottom[2]) / (top[0] ** 2), "b": bottom[2]}
+
+
+mat = Material("test", E0=1e6, poisson=0.2, density=1000)
+sec = Section("test", SectionType.Line, Circle(mat.id, 0.5))
+
+pts = []
+for i in range(yn + 1):
+    y = center[1] - wy / 2 + i * wy / yn
+    chain = []
+    for j in range(zn + 1):
+        h = wz0 - parabolaBottom(y)[2]
+        z = parabolaBottom(y)[2] + j * h / zn
+        chain.append(parabola(y, z))
+    chain.reverse()
+    for j in range(1, zn + 1):
+        chain.append([-chain[zn - j][0], chain[zn - j][1], chain[zn - j][2]])
+    for j in range(len(chain)):
+        pts.append(Node(chain[j][0], chain[j][1], chain[j][2]))
+
+for i in range(yn + 1):
+    for j in range(zn * 2):
+        Element(sid=sec.id, type=ElementType.Link,
+                nids=[pts[i * (2 * zn + 1) + j].id, pts[i * (2 * zn + 1) + j + 1].id])
+for i in range(yn):
+    for j in range(zn * 2 + 1):
+        Element(sid=sec.id, type=ElementType.Link,
+                nids=[pts[i * (2 * zn + 1) + j].id, pts[(i + 1) * (2 * zn + 1) + j].id])
+
+FemModel.toViewer()
+  效果
+
+logo
+
+3、结构模型
+开洞立方体
+  Python代码
+
+from pypcae.enums import *
+from pypcae.comp import *
+from pypcae.stru import StruModel
+
+a, b = 1.0, 0.25
+
+nbox = [
+    Node(0, 0, 0).id,
+    Node(a, 0, 0).id,
+    Node(a, a, 0).id,
+    Node(0, a, 0).id,
+    Node(0, 0, a).id,
+    Node(a, 0, a).id,
+    Node(a, a, a).id,
+    Node(0, a, a).id,
+]
+
+nhole = [
+    Node(b, 0, b).id,
+    Node(a - b, 0, b).id,
+    Node(a - b, 0, a - b).id,
+    Node(b, 0, a - b).id,
+    Node(b, a, b).id,
+    Node(a - b, a, b).id,
+    Node(a - b, a, a - b).id,
+    Node(b, a, a - b).id,
+]
+
+wbox = [
+    Line(nbox[0], nbox[1]).id,
+    Line(nbox[1], nbox[2]).id,
+    Line(nbox[2], nbox[3]).id,
+    Line(nbox[3], nbox[0]).id,
+
+    Line(nbox[4], nbox[5]).id,
+    Line(nbox[5], nbox[6]).id,
+    Line(nbox[6], nbox[7]).id,
+    Line(nbox[7], nbox[4]).id,
+
+    Line(nbox[1], nbox[5]).id,
+    Line(nbox[2], nbox[6]).id,
+    Line(nbox[3], nbox[7]).id,
+    Line(nbox[0], nbox[4]).id
+]
+
+whole = [
+    Line(nhole[0], nhole[1]).id,
+    Line(nhole[1], nhole[2]).id,
+    Line(nhole[2], nhole[3]).id,
+    Line(nhole[3], nhole[0]).id,
+
+    Line(nhole[4], nhole[5]).id,
+    Line(nhole[5], nhole[6]).id,
+    Line(nhole[6], nhole[7]).id,
+    Line(nhole[7], nhole[4]).id,
+
+    Line(nhole[1], nhole[5]).id,
+    Line(nhole[2], nhole[6]).id,
+    Line(nhole[3], nhole[7]).id,
+    Line(nhole[0], nhole[4]).id
+]
+
+sbottom = Surf([wbox[0], wbox[1], wbox[2], wbox[3]]).id
+stop = Surf([wbox[4], wbox[5], wbox[6], wbox[7]]).id
+s1 = Surf([[wbox[0], wbox[8], wbox[4], wbox[11]], [whole[0], whole[1], whole[2], whole[3]]]).id
+s2 = Surf([wbox[1], wbox[9], wbox[5], wbox[8]]).id
+s3 = Surf([[wbox[2], wbox[10], wbox[6], wbox[9]], [whole[4], whole[5], whole[6], whole[7]]]).id
+s4 = Surf([wbox[3], wbox[11], wbox[7], wbox[10]]).id
+shole1 = Surf([whole[0], whole[8], whole[4], whole[11]]).id
+shole2 = Surf([whole[1], whole[9], whole[5], whole[8]]).id
+shole3 = Surf([[whole[2], whole[10], whole[6], whole[9]]]).id
+shole4 = Surf([whole[3], whole[11], whole[7], whole[10]]).id
+
+Solid([sbottom, stop, s1, s2, s3, s4, shole1, shole2, shole3, shole4])
+
+StruModel.toViewer()
+  效果
+
+logo
+
+圆柱圆锥
+  Python代码
+
+from pypcae.enums import *
+from pypcae.comp import *
+from pypcae.stru import StruModel
+
+a, h1, h2 = 1.0, 1.0, 2.0
+
+n = [
+    Node(0,  0,  0).id,
+    Node(a,  0,  0).id,
+    Node(-a, 0,  0).id,
+    Node(0,  0, h1).id,
+    Node(a,  0, h1).id,
+    Node(-a, 0, h1).id,
+    Node(0,  0, h2).id
+]
+
+w = [
+    Line(n[1], n[2], center=n[0], kp=n[6], type=LineType.Arc).id,
+    Line(n[4], n[5], center=n[3], kp=n[6], type=LineType.Arc).id,
+    Line(n[2], n[1]).id,
+    Line(n[5], n[6]).id,
+    Line(n[4], n[6]).id,
+    Line(n[2], n[5]).id,
+    Line(n[1], n[4]).id,
+]
+
+s = [
+    Surf(bottom=w[0], top=w[1], type=SurfType.Cylinder).id,
+    Surf(bottom=w[1], top=n[6], type=SurfType.Cone).id,
+    Surf([w[0], w[2]], type=SurfType.Plane).id,
+    Surf([w[2], w[5], w[3], w[4], w[6]], type=SurfType.Plane).id,
+]
+
+Solid([s[0], s[1], s[2], s[3]])
+
+StruModel.toViewer()
+  效果
+
+logo
+
+简单结构
+  Python代码
+
+from pypcae.enums import *
+from pypcae.comp import *
+from pypcae.stru import StruModel
+
+clc()
+mat = Material(name='测试材料')
+colSec = Section("col", SectionType.Line, Rectangle(mat.id, b=0.6, h=0.6))
+beamSec = Section("beam", SectionType.Line, Rectangle(mat.id, b=0.3, h=0.6))
+braceSec = Section("beam", SectionType.Line, Tube(mat.id, D=0.1, d=0.08))
+wallSec = Section("wall", SectionType.Surface, SingleLayer(mat.id, t=0.2))
+plateSec = Section("plate", SectionType.Surface, SingleLayer(mat.id, t=0.1))
+
+floorNum, a = 10,10
+
+nids = []
+for i in range(floorNum+1):
+    z = i*3
+    nids.extend([Node(0,0,z).id, Node(a,0,z).id, Node(2*a,0,z).id, Node(3*a,0,z).id,
+    Node(0,a,z).id, Node(a,a,z).id, Node(2*a,a,z).id, Node(3*a,a,z).id])
+    if i == 0:
+        Fixed([nid for nid in nids], Dof.All)
+
+cols = []
+beams = []
+braces = []
+walls = []
+plates = []
+for i in range(floorNum):
+    ibasePre = i*8
+    ibase = (i+1)*8
+    for j in range(8):
+        e = BeamColumn([nids[ibasePre+j], nids[ibase+j]], ComponentType.COLUMN, sid=colSec.id, normal=[0, 1, 0])
+        cols.append(e.id)
+    for j in range(3):
+        e1 = BeamColumn([nids[ibase+j], nids[ibase+(j+1)]], ComponentType.BEAM, sid=beamSec.id, normal=[0, 1, 0])
+        e2 = BeamColumn([nids[ibase+4+j], nids[ibase+4+(j+1)]], ComponentType.BEAM, sid=beamSec.id, normal=[0, 1, 0])
+        beams.extend([e1.id,e2.id])
+    for j in range(4):
+        e = BeamColumn([nids[ibase+j], nids[ibase+4+j]], ComponentType.BEAM, sid=beamSec.id, normal=[1, 0, 0])
+        beams.append(e.id)
+
+for i in range(floorNum):
+    ibasePre = i*8
+    ibase = (i+1)*8
+    e1 = BeamColumn([nids[ibasePre], nids[ibase+4]], ComponentType.BRACE, sid=braceSec.id, normal=[1, 0, 0])
+    e2 = BeamColumn([nids[ibasePre+4], nids[ibase]], ComponentType.BRACE, sid=braceSec.id, normal=[1, 0, 0])
+    braces.extend([e1.id,e2.id])
+    e1 = BeamColumn([nids[ibasePre+3], nids[ibase+7]], ComponentType.BRACE, sid=braceSec.id, normal=[1, 0, 0])
+    e2 = BeamColumn([nids[ibasePre+7], nids[ibase+3]], ComponentType.BRACE, sid=braceSec.id, normal=[1, 0, 0])
+    braces.extend([e1.id,e2.id])
+
+for i in range(floorNum):
+    ibasePre = i*8
+    ibase = (i+1)*8
+    e1 = Wall([nids[ibasePre+1], nids[ibasePre+5], nids[ibase+5], nids[ibase+1]], sid=wallSec.id)
+    e2 = Wall([nids[ibasePre+2], nids[ibasePre+6], nids[ibase+6], nids[ibase+2]], sid=wallSec.id)
+    walls.extend([e1.id,e2.id])
+
+for i in range(floorNum):
+    ibase = (i+1)*8
+    e1 = Plate([nids[ibase], nids[ibase+1], nids[ibase+5], nids[ibase+4]], sid=plateSec.id)
+    e2 = Plate([nids[ibase+1], nids[ibase+2], nids[ibase+6], nids[ibase+5]], sid=plateSec.id)
+    e3 = Plate([nids[ibase+2], nids[ibase+3], nids[ibase+7], nids[ibase+6]], sid=plateSec.id)
+    plates.extend([e1.id,e2.id,e3.id])
+
+StruModel.toViewer()
+  效果
+
+logo
+
