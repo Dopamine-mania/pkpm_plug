@@ -9,6 +9,8 @@ __pycache__/
 .claude/
 
 # Generated / temp artifacts (keep sources, ignore extractions)
+.tmp_*/
+.tmp*/
 tmp_*/
 tmp_*.docx
 tmp_*.pdf
@@ -23,8 +25,15 @@ NUL
 Demond.zip
 ~$*.docx
 
+# Build artifacts
+build/
+dist/
+
 # Too large for GitHub (use Releases / cloud storage instead)
 阶段成果/pkpm_composite_beam_V3.2_FINAL/pkpm_composite_beam_交付1.2.zip
+# Delivery / acceptance zips (keep in local storage or Releases, not in git)
+阶段成果/**/*.zip
+阶段成果/**/*.mp4
 
 # OS
 .DS_Store

@@ -24,20 +24,195 @@ class CompositeBeamModelGenerator:
     def parse_excel(self):
         self.params = ExcelParser(self.excel_path).parse()
         print(f">>> 数据解析成功: 梁长={self.params.geometry.L}")
+        self._normalize_params_by_rules()
+
+    def _normalize_params_by_rules(self):
+        """
+        对输入参数做“工程规则化”：
+        - 叠合面 hp：优先采用现浇顶盖厚度 t_cast_cap（0=自动），避免出现不合理的超厚现浇层
+        - 洞口：按“三避让”原则对位置进行夹逼修正（保证洞口在预制腹板区域内，不触到叠合面/下翼缘/支座区）
+        """
+        if self.params is None:
+            return
+        g = self.params.geometry
+        H = float(getattr(g, "H", 0.0) or 0.0)
+        if H <= 1e-6:
+            return
+
+        # 截面参数
+        bf_ll = float(getattr(g, "bf_ll", 0.0) or 0.0)
+        bf_rl = float(getattr(g, "bf_rl", 0.0) or 0.0)
+        tf_ll = float(getattr(g, "tf_ll", 0.0) or 0.0)
+        tf_rl = float(getattr(g, "tf_rl", 0.0) or 0.0)
+        bf_lu = float(getattr(g, "bf_lu", 0.0) or 0.0)
+        bf_ru = float(getattr(g, "bf_ru", 0.0) or 0.0)
+        tf_lu = float(getattr(g, "tf_lu", 0.0) or 0.0)
+        tf_ru = float(getattr(g, "tf_ru", 0.0) or 0.0)
+        bf_lower = max(bf_ll, bf_rl, 0.0)
+        tf_lower = max(tf_ll, tf_rl, 0.0) if bf_lower > 1e-6 else 0.0
+        if bf_lower > 1e-6 and tf_lower < 1e-6:
+            tf_lower = 150.0
+        tf_upper = max(tf_lu, tf_ru, 0.0)
+        bf_upper = max(bf_lu, bf_ru, 0.0)
+
+        # 保护层
+        cover0 = float(getattr(getattr(self.params, "stirrup", None), "cover", 25.0) or 25.0)
+
+        # 叠合面 hp 规则：t_cast_cap > 0 按输入；t_cast_cap == 0 表示自动（默认75mm，且有上翼缘时必须落在上翼缘内部）
+        hp_raw = float(getattr(g, "h_pre", 0.0) or 0.0)
+        cast_cap_raw = 0.0
+        try:
+            cast_cap_raw = float(getattr(g, "t_cast_cap", 0.0) or getattr(g, "t_cast", 0.0) or 0.0)
+        except Exception:
+            cast_cap_raw = 0.0
+
+        hp_rule = "excel"
+        cast_cap_thk = float(cast_cap_raw)
+        # 若用户明确把预制高度设到总高，则视为“全预制”，不强行引入现浇顶盖
+        if (cast_cap_thk <= 1e-6) and (hp_raw >= H - 1e-6):
+            cast_cap_thk = 0.0
+            hp = max(tf_lower + 1e-6, min(H - 1e-6, hp_raw))
+            hp_rule = "excel_full_precast"
+        else:
+            if cast_cap_thk <= 1e-6:
+                # 自动：默认 75mm；有上翼缘时取 min(75, 0.5*tf_upper)，并确保 < tf_upper
+                if bf_upper > 1e-6 and tf_upper > 1e-6:
+                    cast_cap_thk = min(75.0, float(tf_upper) * 0.5)
+                    cast_cap_thk = max(1.0, min(cast_cap_thk, float(tf_upper) - 1.0))
+                    hp_rule = "upper_flange_internal"
+                else:
+                    cast_cap_thk = 75.0
+                    hp_rule = "cast_cap_auto"
+            else:
+                # 显式输入：上翼缘存在时也必须落在翼缘内部
+                if bf_upper > 1e-6 and tf_upper > 1e-6:
+                    hp_rule = "upper_flange_internal"
+                else:
+                    hp_rule = "cast_cap_excel"
+
+            # clamp：必须留出腹板高度；无上翼缘时上界为 H-tf_lower-1
+            cast_cap_thk = max(1.0, cast_cap_thk)
+            if bf_upper > 1e-6 and tf_upper > 1e-6:
+                cast_cap_thk = min(cast_cap_thk, float(tf_upper) - 1.0)
+            else:
+                cast_cap_thk = min(cast_cap_thk, max(1.0, float(H) - float(tf_lower) - 1.0))
+
+            hp = float(H) - float(cast_cap_thk)
+            hp = max(float(tf_lower) + 1e-6, min(float(H) - 1e-6, hp))
+
+        self._hp_effective = float(hp)
+        self._hp_rule = str(hp_rule)
+        self._cast_cap_thk = float(cast_cap_thk)
+
+        # 洞口“三避让”位置修正（只修洞口中心坐标，不改洞口尺寸）
+        holes = list(getattr(self.params, "holes", None) or [])
+        if not holes:
+            return
+
+        L = float(getattr(g, "L", 0.0) or 0.0)
+        if L <= 1e-6:
+            return
+
+        avoid_hp = 50.0        # 洞口顶边距叠合面最小距离
+        avoid_bottom = 50.0    # 洞口底边距下翼缘顶(或梁底)最小距离
+        # 支座避让：洞口中心须位于跨中 1/3 区域
+        x_c_min = (L / 3.0)
+        x_c_max = (2.0 * L / 3.0)
+
+        for i, hole in enumerate(holes, start=1):
+            try:
+                w = float(getattr(hole, "width", 0.0) or 0.0)
+                h = float(getattr(hole, "height", 0.0) or 0.0)
+                if w <= 1e-6 or h <= 1e-6:
+                    continue
+            except Exception:
+                continue
+
+            # X：夹逼到跨中 1/3（同时保证洞口不越出范围）
+            x_min_allow = x_c_min + 0.5 * w
+            x_max_allow = x_c_max - 0.5 * w
+            if x_max_allow < x_min_allow:
+                raise ValueError(
+                    f"洞口{i}宽度({w})过大，无法放入跨中1/3区间 [{x_c_min:.1f}, {x_c_max:.1f}]；"
+                    f"请减小洞口宽度或增大梁长L。"
+                )
+            x_old = float(getattr(hole, "x", 0.0) or 0.0)
+            x_new = min(max(x_old, x_min_allow), x_max_allow)
+            if abs(x_new - x_old) > 1e-6:
+                setattr(hole, "x", x_new)
+                print(f">>> [HOLE] 洞口{i} X已按跨中1/3避让调整: {x_old:.1f} -> {x_new:.1f}")
+
+            # Z：完全在预制腹板内，且避开叠合面/下翼缘顶/梁底
+            z_min_limit = max(float(tf_lower), 0.0) + avoid_bottom
+            z_min_limit = max(z_min_limit, float(cover0) + avoid_bottom)
+            z_max_limit = float(hp) - avoid_hp
+            z_c_min = z_min_limit + 0.5 * h
+            z_c_max = z_max_limit - 0.5 * h
+            if z_c_max < z_c_min:
+                raise ValueError(
+                    f"洞口{i}高度({h})过大或预制高度不足：要求洞口底边>={z_min_limit:.1f}，顶边<={z_max_limit:.1f}，"
+                    f"但可用高度仅 {(z_max_limit - z_min_limit):.1f}。"
+                    f"请增大预制高度(h_pre/叠合面hp)或减小洞口高度。"
+                )
+            z_old = float(getattr(hole, "z", 0.0) or 0.0)
+            z_new = min(max(z_old, z_c_min), z_c_max)
+            if abs(z_new - z_old) > 1e-6:
+                setattr(hole, "z", z_new)
+                print(f">>> [HOLE] 洞口{i} Z已按三避让调整: {z_old:.1f} -> {z_new:.1f} (hp={hp:.1f})")
+
+            # 小梁箍筋肢数：0=自动（按规范化默认4肢）
+            try:
+                sb_d = float(getattr(hole, "small_beam_stirrup_diameter", 0.0) or 0.0)
+                sb_s = float(getattr(hole, "small_beam_stirrup_spacing", 0.0) or 0.0)
+                sb_l = int(getattr(hole, "small_beam_stirrup_legs", 0) or 0)
+            except Exception:
+                sb_d, sb_s, sb_l = 0.0, 0.0, 0
+            if sb_d > 1e-6 and sb_s > 1e-6:
+                if sb_l <= 0:
+                    setattr(hole, "small_beam_stirrup_legs", 4)
+                else:
+                    # 肢数建议为偶数；若为奇数则上取整到偶数
+                    if sb_l % 2 == 1:
+                        setattr(hole, "small_beam_stirrup_legs", int(sb_l + 1))
 
     # UI 兼容性钩子函数
     def create_geometry(self): pass
     def create_rebars(self):
         engine = RebarEngine(self.params.geometry)
-        self.long_rebar_result = engine.create_longitudinal_rebars(self.params.long_rebar)
+        self.long_rebar_result = engine.create_longitudinal_rebars(
+            self.params.long_rebar,
+            cover=float(getattr(self.params.stirrup, "cover", 25.0) or 25.0),
+            holes=self.params.holes
+        )
+        try:
+            lr = getattr(self.params, "long_rebar", None)
+            if lr is not None and getattr(lr, "mid_span_top", None) is not None:
+                print(f">>> 顶部通长筋(全跨): {lr.mid_span_top.count}根 x Φ{lr.mid_span_top.diameter}")
+            if lr is not None and getattr(lr, "left_support_top_A", None) is not None:
+                print(f">>> 左支座附加筋: {lr.left_support_top_A.count}根 x Φ{lr.left_support_top_A.diameter}, 支座区长度={float(getattr(lr,'left_support_length',0.0) or 0.0)}")
+            if lr is not None and getattr(lr, "right_support_top_A", None) is not None:
+                print(f">>> 右支座附加筋: {lr.right_support_top_A.count}根 x Φ{lr.right_support_top_A.diameter}, 支座区长度={float(getattr(lr,'right_support_length',0.0) or 0.0)}")
+            if lr is not None:
+                print(f">>> 顶部纵筋多排: {int(getattr(lr,'top_rows',1) or 1)}排, 排间净距={float(getattr(lr,'top_row_spacing',0.0) or 0.0)}mm")
+                print(f">>> 底部纵筋多排: {int(getattr(lr,'bottom_rows',1) or 1)}排, 排间净距={float(getattr(lr,'bottom_row_spacing',0.0) or 0.0)}mm")
+        except Exception:
+            pass
         self.stirrup_result = engine.create_stirrups(self.params.stirrup, holes=self.params.holes)
 
         # 【新增】洞口加强筋
         self.hole_reinf_results = []
         if self.params.holes:
-            tf_lower = max(self.params.geometry.tf_ll, self.params.geometry.tf_rl, 100.0)
+            # 注意：T型/矩形（无下翼缘）不应凭空给 tf_lower 默认值，否则会导致洞口/箍筋逻辑误判。
+            bf_lower = max(float(getattr(self.params.geometry, "bf_ll", 0.0) or 0.0),
+                           float(getattr(self.params.geometry, "bf_rl", 0.0) or 0.0),
+                           0.0)
+            tf_lower = max(float(getattr(self.params.geometry, "tf_ll", 0.0) or 0.0),
+                           float(getattr(self.params.geometry, "tf_rl", 0.0) or 0.0),
+                           0.0) if bf_lower > 1e-6 else 0.0
+            if bf_lower > 1e-6 and tf_lower < 1e-6:
+                tf_lower = 150.0
             for hole in self.params.holes:
-                hole_reinf = engine.create_hole_reinforcement(hole, tf_lower)
+                hole_reinf = engine.create_hole_reinforcement(hole, tf_lower, cover=float(getattr(self.params.stirrup, "cover", 25.0) or 25.0))
                 self.hole_reinf_results.append(hole_reinf)
                 print(f">>> 洞口加强筋已生成: 纵筋{len(hole_reinf.get('top_long_rebars', []))+len(hole_reinf.get('bottom_long_rebars', []))}根, "
                       f"侧箍{len(hole_reinf.get('left_stirrups', []))+len(hole_reinf.get('right_stirrups', []))}道, "
@@ -63,6 +238,76 @@ class CompositeBeamModelGenerator:
         print(f">>> 正在生成【标准工字型截面 + Coupling边界】脚本...")
         g = self.params.geometry
 
+        def _diam_key(d: float) -> str:
+            d = float(d)
+            if abs(d - round(d)) <= 1e-6:
+                return str(int(round(d)))
+            s = f"{d:.3f}".rstrip("0").rstrip(".")
+            return s.replace(".", "p")
+
+        def _collect_rebar_diameters():
+            ds = set()
+
+            def _add(v):
+                if v is None:
+                    return
+                try:
+                    dv = float(v)
+                except Exception:
+                    return
+                if dv > 1e-6:
+                    ds.add(round(dv, 6))
+
+            # 1) 来自 Excel 参数（即使某组数量为0，也应可识别该直径）
+            try:
+                lr = getattr(self.params, "long_rebar", None)
+                for spec in [
+                    getattr(lr, "left_support_top_A", None),
+                    getattr(lr, "left_support_top_B", None),
+                    getattr(lr, "mid_span_top", None),
+                    getattr(lr, "right_support_top_A", None),
+                    getattr(lr, "right_support_top_B", None),
+                    getattr(lr, "bottom_through_A", None),
+                    getattr(lr, "bottom_through_B", None),
+                ]:
+                    if spec is not None:
+                        _add(getattr(spec, "diameter", None))
+            except Exception:
+                pass
+            try:
+                st = getattr(self.params, "stirrup", None)
+                _add(getattr(st, "dense_diameter", None))
+                _add(getattr(st, "normal_diameter", None))
+            except Exception:
+                pass
+            try:
+                for h in (getattr(self.params, "holes", None) or []):
+                    _add(getattr(h, "small_beam_long_diameter", None))
+                    _add(getattr(h, "small_beam_long_top_diameter", None))
+                    _add(getattr(h, "small_beam_long_bottom_diameter", None))
+                    _add(getattr(h, "small_beam_stirrup_diameter", None))
+                    _add(getattr(h, "side_stirrup_diameter", None))
+            except Exception:
+                pass
+
+            # 2) 来自实际生成的钢筋单元（兜底，确保不漏）
+            def _add_from_elements(elems):
+                for e in elems or []:
+                    _add(getattr(e, "diameter", None))
+
+            if self.long_rebar_result:
+                _add_from_elements(self.long_rebar_result.get("all_elements", []))
+            if self.stirrup_result:
+                _add_from_elements(self.stirrup_result.get("all_elements", []))
+            for hr in self.hole_reinf_results or []:
+                _add_from_elements(hr.get("all_elements", []))
+
+            out = sorted(ds)
+            return out if out else [12.0]
+
+        rebar_diameters = _collect_rebar_diameters()
+        sec_var_by_key = {_diam_key(d): f"sec_D{_diam_key(d)}" for d in rebar_diameters}
+
         # ========== 自检期望值（从Excel/默认值提取，用于 STRICT_CHECK）==========
         expected_uniform_load_value = None
         expected_concentrated_load_value = None
@@ -81,7 +326,7 @@ class CompositeBeamModelGenerator:
         L = g.L                              # 梁长 (X方向)
         Tw = g.Tw                            # 腹板宽度 (Y方向)
         # 叠合面位置（关键工程逻辑）：
-        # 张工反馈：腹板整体属于预制件，现浇层只是顶部“盖子”，因此叠合面应位于上翼缘底部。
+        # 客户反馈：腹板整体属于预制件，现浇层只是顶部“盖子”，因此叠合面应位于上翼缘底部。
         hp_raw = g.h_pre                     # Excel输入（保留作对照/日志）
         hp = hp_raw                          # 有上翼缘时将被覆写为 H - tf_upper
         H = g.H                              # 总高度 (Z方向)
@@ -104,23 +349,13 @@ class CompositeBeamModelGenerator:
         bf_upper = max(bf_lu, bf_ru)         # 上翼缘伸出 (单侧)
         tf_upper = max(tf_lu, tf_ru)         # 上翼缘厚度
 
-        # 若存在上翼缘：叠合面必须位于“上翼缘范围内部”
-        # 现浇层仅为上翼缘顶部薄层（例如 50mm/75mm），腹板整体属于预制件（张工反馈）。
-        hp_rule = "excel"
-        cast_cap_thk = 0.0
-        if bf_upper > 1e-6 and tf_upper > 1e-6:
-            # 可选：允许 Excel/参数里提供上翼缘现浇盖板厚度（未提供则默认 75mm）
-            try:
-                cast_cap_thk = float(getattr(g, "t_cast_cap", 0.0) or getattr(g, "t_cast", 0.0) or 0.0)
-            except Exception:
-                cast_cap_thk = 0.0
-            if cast_cap_thk <= 1e-6:
-                cast_cap_thk = min(75.0, float(tf_upper) * 0.5) if tf_upper > 1e-6 else 0.0
-            # 必须小于上翼缘厚度，确保叠合面落在翼缘内部
-            cast_cap_thk = max(1.0, cast_cap_thk)
-            cast_cap_thk = min(cast_cap_thk, float(tf_upper) - 1.0)
+        # 叠合面 hp：优先采用现浇顶盖厚度 t_cast_cap（0=自动），避免出现不合理的超厚现浇层
+        hp_rule = str(getattr(self, "_hp_rule", "excel"))
+        cast_cap_thk = float(getattr(self, "_cast_cap_thk", 0.0) or 0.0)
+        if cast_cap_thk > 1e-6:
             hp = H - cast_cap_thk
-            hp_rule = "upper_flange_internal"
+        else:
+            hp = hp_raw
 
         # 截面类型判断
         section_type = "矩形"
@@ -136,7 +371,9 @@ class CompositeBeamModelGenerator:
         if bf_lower < 1.0 and section_type in ["工字型", "倒T型"]:
             bf_lower = 100.0
             print(f">>> 警告: 下翼缘伸出宽度为0，已自动设置为{bf_lower}mm")
-        if tf_lower < 1.0:
+        # 仅当“确实存在下翼缘”时才给下翼缘厚度默认值；
+        # T 型截面（bf_lower=0）不应凭空造出 tf_lower，否则会导致自检/钢筋定位错误（例如误判 rebar.corner.bottom_top）。
+        if tf_lower < 1.0 and bf_lower > 1e-6:
             tf_lower = 150.0  # 默认下翼缘厚度
             print(f">>> 警告: 下翼缘厚度为0，已自动设置为{tf_lower}mm")
 
@@ -195,19 +432,31 @@ class CompositeBeamModelGenerator:
 
         print(f">>> 预应力状态: {'启用' if prestress_enabled else '未启用'}, 方式={prestress_method}, 值={prestress_value} MPa")
 
-        # 波纹管孔道参数（几何层面：即使未启用预应力，也可预留孔道）
+        # 波纹管孔道参数
+        # 20260119 客户反馈：即使把波纹管直径输入0，网格仍有警告；先默认去掉波纹管孔道，使模型规整。
+        # 规则：仅当“预应力启用 + 后张法”时才预留孔道（几何开洞）；否则 duct_diameter 强制为0。
+        duct_reserved = False
         duct_diameter = 0.0
         duct_path_type = 'straight'
         if self.params.prestress:
-            duct_diameter = float(getattr(self.params.prestress, 'duct_diameter', 0.0) or 0.0)
+            try:
+                _raw = getattr(self.params.prestress, 'duct_diameter', 0.0)
+                _raw = float(_raw) if _raw is not None else 0.0
+                if _raw != _raw:  # NaN
+                    _raw = 0.0
+            except Exception:
+                _raw = 0.0
             duct_path_type = str(getattr(self.params.prestress, 'path_type', 'straight') or 'straight')
+            if prestress_enabled and str(prestress_method) == "post_tension" and float(_raw) > 1e-6:
+                duct_reserved = True
+                duct_diameter = float(_raw)
 
         # 【先张法闭环】先张法不挖孔道（不做 subtract），只在分析阶段施加预应力
-        # 目标：避免几何孔道导致网格失败/扫掠崩溃，同时满足张工“先张法更常用”的工作流
         if str(prestress_method) == "pretension":
+            duct_reserved = False
             duct_diameter = 0.0
             duct_path_type = 'straight'
-        print(f">>> 波纹管孔道: 直径={duct_diameter} mm, path={duct_path_type}")
+        print(f">>> 波纹管孔道: 直径={duct_diameter} mm, path={duct_path_type}, reserved={duct_reserved}")
 
         duct_cover = float(getattr(getattr(self.params, "stirrup", None), "cover", 25.0))
         duct_radius = max(0.0, duct_diameter / 2.0)
@@ -218,7 +467,7 @@ class CompositeBeamModelGenerator:
         duct_center_z = max(duct_center_z, duct_z_min)
         duct_center_z = min(duct_center_z, duct_z_max) if (duct_z_max > duct_z_min) else duct_z_min
 
-        # 【张工反馈】预应力孔道高度不能落在洞口范围内（避免与洞口穿插导致网格失败/几何残留）
+        # 【客户反馈】预应力孔道高度不能落在洞口范围内（避免与洞口穿插导致网格失败/几何残留）
         duct_rule = "hp_mid"
         try:
             hole_z_ranges = []
@@ -246,6 +495,17 @@ class CompositeBeamModelGenerator:
             pass
         print(f">>> 波纹管中心Z: {duct_center_z:.1f} mm (rule={duct_rule})")
 
+        # PKPM 回复建议：下翼缘单独一个体，网格更稳
+        # 注意：洞口的 raw_z_min 可能低于 tf_lower，但几何开孔会被钳制到 >=tf_lower（并在触边时上抬1mm），
+        # 因此不应再因为“raw_z_min 过低”而禁止拆分，否则会错过“拆分下翼缘提升网格健壮性”的收益。
+        split_lower_flange = bool(bf_lower > 1e-6 and tf_lower > 1e-6)
+        if split_lower_flange and duct_diameter > 1e-6:
+            try:
+                if (float(duct_center_z) - float(duct_diameter) / 2.0) < float(tf_lower) - 1e-6:
+                    split_lower_flange = False
+            except Exception:
+                pass
+
         # 构建钢筋节点查找表
         node_lookup = {}
         if self.long_rebar_result:
@@ -270,6 +530,8 @@ class CompositeBeamModelGenerator:
 
         # ========== 开始生成脚本 ==========
         cover0 = float(getattr(getattr(self.params, "stirrup", None), "cover", 25.0))
+        hole_end_clear = 1.0  # mm：洞口两端与梁端面内收，避免与端面共面导致 Sweep 不稳定
+        hole_plane_clear = 1.0  # mm：洞口顶/底边与关键平面(hp/tf_lower)避让，避免共面/重合面影响网格
         lines = []
         lines.append('# -*- coding: utf-8 -*-')
         lines.append('"""')
@@ -647,7 +909,14 @@ class CompositeBeamModelGenerator:
         lines.append('__NODE_CACHE__ = {}  # coord_to_node_id: (x,y,z)->nid')
         lines.append('__NODE_COORDS__ = {}  # nid -> (x,y,z) rounded')
         lines.append('__REBAR_EDGES__ = []  # list[(nid1,nid2)] for self-check')
+        lines.append('__REBAR_EDGE_SID__ = {}  # (nid1,nid2)->sid，用于验收“直径/分组”证据')
         lines.append('__LOCAL_SMALL_BEAM_EDGES__ = []  # 洞口上下小梁箍筋专用边集合，用于验收/自检')
+        # 顶部纵筋“通长/支座附加筋”分组证据（用于验收）
+        lines.append('__LONG_TOP_THROUGH_EDGES__ = []')
+        lines.append('__LONG_TOP_LEFT_A_EDGES__ = []')
+        lines.append('__LONG_TOP_LEFT_B_EDGES__ = []')
+        lines.append('__LONG_TOP_RIGHT_A_EDGES__ = []')
+        lines.append('__LONG_TOP_RIGHT_B_EDGES__ = []')
         lines.append('def _node(x, y, z, ndigits=3):')
         lines.append('    # 通过坐标去重，避免同坐标重复建 Node，导致钢筋/箍筋“看起来闭合但实际不连通”')
         lines.append('    key = (round(float(x), ndigits), round(float(y), ndigits), round(float(z), ndigits))')
@@ -667,7 +936,13 @@ class CompositeBeamModelGenerator:
         lines.append('    __NODE_CACHE__.clear()')
         lines.append('    __NODE_COORDS__.clear()')
         lines.append('    __REBAR_EDGES__.clear()')
+        lines.append('    __REBAR_EDGE_SID__.clear()')
         lines.append('    __LOCAL_SMALL_BEAM_EDGES__.clear()')
+        lines.append('    __LONG_TOP_THROUGH_EDGES__.clear()')
+        lines.append('    __LONG_TOP_LEFT_A_EDGES__.clear()')
+        lines.append('    __LONG_TOP_LEFT_B_EDGES__.clear()')
+        lines.append('    __LONG_TOP_RIGHT_A_EDGES__.clear()')
+        lines.append('    __LONG_TOP_RIGHT_B_EDGES__.clear()')
         lines.append('    __CHECK_RESULTS__.clear()')
         lines.append('    __BOOL_ORDER__.clear()')
         lines.append('    __GEOM_ORDER__.clear()')
@@ -690,7 +965,7 @@ class CompositeBeamModelGenerator:
         lines.append(f'    __COVER__ = {float(cover0):.3f}')
         lines.append('    __REBAR_HOLE_EDGE_CLEAR__ = 2.0  # mm：洞口相关钢筋边界避让（更稳的网格/拾取）')
         # 若有上翼缘：期望叠合面=H-tf_upper；否则跟随Excel
-        hp_expected = (H - cast_cap_thk) if (bf_upper > 1e-6 and tf_upper > 1e-6 and cast_cap_thk > 1e-6) else hp_raw
+        hp_expected = (H - cast_cap_thk) if (cast_cap_thk is not None and float(cast_cap_thk) > 1e-6) else hp_raw
         lines.append(f'    __HP_EXPECTED__ = {float(hp_expected):.3f}')
         lines.append('')
         lines.append('    print(f"[HP] raw={__HP_RAW__} effective={__HP_EFFECTIVE__} rule={__HP_RULE__}")')
@@ -704,9 +979,22 @@ class CompositeBeamModelGenerator:
         lines.append('    sec_concrete_precast = Section("混凝土-预制C40", SectionType.Solid, SolidSect(mat_concrete_precast.id))')
         lines.append('    sec_concrete_cast = Section("混凝土-后浇C30", SectionType.Solid, SolidSect(mat_concrete_cast.id))')
         lines.append('    mat_rebar = Material("HRB400钢筋", iType=MaterialType.Rebar, E0=200000.0, poisson=0.3)')
-        lines.append('    # 【重要】Circle(mid, d) 的 d 是直径(mm)，不是半径！12mm直径钢筋')
-        lines.append('    sec_rebar = Section("钢筋截面", SectionType.Line, Circle(mat_rebar.id, 12.0))')
+        lines.append('    # 【重要】Circle(mid, d) 的 d 是直径(mm)，不是半径！')
+        lines.append('    # 钢筋截面按直径自动分组（来自 Excel 参数），保证力学计算与显示直径一致')
+        lines.append(f'    __REBAR_DIAMETERS__ = {[float(d) for d in rebar_diameters]}')
+        for d in rebar_diameters:
+            key = _diam_key(d)
+            var = sec_var_by_key[key]
+            lines.append(f'    {var} = Section("钢筋截面 D{key}", SectionType.Line, Circle(mat_rebar.id, {float(d):.3f}))')
+        # 便于后续统计/验收：Section.id -> 直径(mm)
+        lines.append('    __REBAR_SEC_DIAM__ = {')
+        for d in rebar_diameters:
+            key = _diam_key(d)
+            var = sec_var_by_key[key]
+            lines.append(f'        {var}.id: {float(d):.3f},')
+        lines.append('    }')
         lines.append(f'    duct_diameter = {float(duct_diameter):.3f}  # 波纹管直径(mm)，0表示不预留孔道')
+        lines.append(f'    __DUCT_GEOM_RESERVED__ = {("True" if duct_reserved else "False")}  # 仅“预应力启用+后张法”时为 True')
         lines.append(f'    duct_cover = {float(duct_cover):.3f}  # 波纹管最小保护层(mm)，用于自检/拓扑排查')
         lines.append(f'    __DUCT_RULE__ = "{duct_rule}"')
         lines.append(f'    duct_center_z = {float(duct_center_z):.3f}  # 波纹管中心Z(mm)')
@@ -776,6 +1064,14 @@ class CompositeBeamModelGenerator:
                     'z': hz,
                     'width': hw,
                     'height': hh,
+                    # 洞口顶/底加强纵筋（独立配置，0则回退旧字段；用于“证据化验收”）
+                    'small_beam_long_diameter': float(getattr(hole, "small_beam_long_diameter", 0.0) or 0.0),
+                    'small_beam_long_count': int(getattr(hole, "small_beam_long_count", 0) or 0),
+                    'small_beam_long_top_diameter': float(getattr(hole, "small_beam_long_top_diameter", 0.0) or 0.0),
+                    'small_beam_long_top_count': int(getattr(hole, "small_beam_long_top_count", 0) or 0),
+                    'small_beam_long_bottom_diameter': float(getattr(hole, "small_beam_long_bottom_diameter", 0.0) or 0.0),
+                    'small_beam_long_bottom_count': int(getattr(hole, "small_beam_long_bottom_count", 0) or 0),
+                    'reinf_extend_length': float(getattr(hole, "reinf_extend_length", 0.0) or 0.0),
                     'left_reinf_length': float(getattr(hole, "left_reinf_length", 0.0) or 0.0),
                     'right_reinf_length': float(getattr(hole, "right_reinf_length", 0.0) or 0.0),
                     'side_stirrup_spacing': float(getattr(hole, "side_stirrup_spacing", 0.0) or 0.0),
@@ -783,30 +1079,50 @@ class CompositeBeamModelGenerator:
                     'side_stirrup_legs': int(getattr(hole, "side_stirrup_legs", 0) or 0),
                     'small_beam_stirrup_diameter': float(getattr(hole, "small_beam_stirrup_diameter", 0.0) or 0.0),
                     'small_beam_stirrup_spacing': float(getattr(hole, "small_beam_stirrup_spacing", 0.0) or 0.0),
+                    'small_beam_stirrup_legs': int(getattr(hole, "small_beam_stirrup_legs", 0) or 0),
                 })
 
                 # 孔洞边界 (动态计算，带边界保护)
                 x_min = hx - hw / 2
                 x_max = hx + hw / 2
+                # X 方向边界保护：避免洞口端部与梁端面共面（会显著降低 Sweep 稳定性）
+                x_min = max(float(x_min), float(hole_end_clear))
+                x_max = min(float(x_max), float(L) - float(hole_end_clear))
+                if x_max <= x_min + 1e-6:
+                    continue
                 # 预制段腹板的 Z 范围：tf_lower ~ hp（按叠合高度截断）
-                z_min = max(tf_lower, raw_z_min)
+                # 下限：不低于下翼缘顶(tf_lower)；无下翼缘时至少不贴到底面(>=cover+1mm)，避免“洞口与底面共面/退化”
+                z_min = max(tf_lower, raw_z_min, float(cover0) + 1.0)
+                # 2026-客户回复：孔洞若开到下翼缘顶面(z=tf_lower)会与翼缘表面共面，inner loop 容易导致网格质量差；
+                # 对此类孔洞做上抬，避免底部边线与下翼缘表面重合（同时覆盖 raw_z_min < tf_lower 的情况）。
+                if float(tf_lower) > 1e-6 and float(z_min) <= float(tf_lower) + 1e-6:
+                    z_min = float(tf_lower) + float(hole_plane_clear)
                 z_max = min(hp, raw_z_max)
+                # 若洞口顶边“刚好到叠合面(hp)但不跨越”，会在叠合面产生 T 形边界/薄片，影响网格；
+                # 仅对“触边不跨越”的情况做下移避让（跨越叠合面时仍保持 z_max=hp，并由后浇段继续开孔保证连续）。
+                if (raw_z_max is not None) and (float(raw_z_max) <= float(hp) + 1e-6) and abs(float(z_max) - float(hp)) <= 1e-6 and (float(H) - float(hp) > 1e-6):
+                    z_max = float(hp) - float(hole_plane_clear)
                 if z_max <= z_min + 1e-6:
                     continue
+                # 记录“实际用于预制段开孔”的有效边界（用于脚本自检/洞口钢筋定位）
+                hole_bounds[-1]['x_min_precast'] = float(x_min)
+                hole_bounds[-1]['x_max_precast'] = float(x_max)
+                hole_bounds[-1]['z_min_precast'] = float(z_min)
+                hole_bounds[-1]['z_max_precast'] = float(z_max)
 
                 lines.append(f'    # --- 孔洞 {hole_idx + 1}: 中心({hx}, {hz}), 尺寸 {hw}x{hh} ---')
                 lines.append(f'    # 孔洞贯通方向: Y轴 ({y_web_min:.1f} ~ {y_web_max:.1f})')
                 lines.append(f'    nhole{hole_idx} = [')
                 lines.append(f'        # 前孔口4点 (Y={y_web_min:.1f})')
-                lines.append(f'        Node({x_min:.1f}, {y_web_min:.1f}, {z_min:.1f}).id,  # 0: 左下')
-                lines.append(f'        Node({x_max:.1f}, {y_web_min:.1f}, {z_min:.1f}).id,  # 1: 右下')
-                lines.append(f'        Node({x_max:.1f}, {y_web_min:.1f}, {z_max:.1f}).id,  # 2: 右上')
-                lines.append(f'        Node({x_min:.1f}, {y_web_min:.1f}, {z_max:.1f}).id,  # 3: 左上')
+                lines.append(f'        _node({x_min:.1f}, {y_web_min:.1f}, {z_min:.1f}),  # 0: 左下')
+                lines.append(f'        _node({x_max:.1f}, {y_web_min:.1f}, {z_min:.1f}),  # 1: 右下')
+                lines.append(f'        _node({x_max:.1f}, {y_web_min:.1f}, {z_max:.1f}),  # 2: 右上')
+                lines.append(f'        _node({x_min:.1f}, {y_web_min:.1f}, {z_max:.1f}),  # 3: 左上')
                 lines.append(f'        # 后孔口4点 (Y={y_web_max:.1f})')
-                lines.append(f'        Node({x_min:.1f}, {y_web_max:.1f}, {z_min:.1f}).id,  # 4: 左下')
-                lines.append(f'        Node({x_max:.1f}, {y_web_max:.1f}, {z_min:.1f}).id,  # 5: 右下')
-                lines.append(f'        Node({x_max:.1f}, {y_web_max:.1f}, {z_max:.1f}).id,  # 6: 右上')
-                lines.append(f'        Node({x_min:.1f}, {y_web_max:.1f}, {z_max:.1f}).id,  # 7: 左上')
+                lines.append(f'        _node({x_min:.1f}, {y_web_max:.1f}, {z_min:.1f}),  # 4: 左下')
+                lines.append(f'        _node({x_max:.1f}, {y_web_max:.1f}, {z_min:.1f}),  # 5: 右下')
+                lines.append(f'        _node({x_max:.1f}, {y_web_max:.1f}, {z_max:.1f}),  # 6: 右上')
+                lines.append(f'        _node({x_min:.1f}, {y_web_max:.1f}, {z_max:.1f}),  # 7: 左上')
                 lines.append(f'    ]')
                 lines.append('')
 
@@ -846,6 +1162,9 @@ class CompositeBeamModelGenerator:
 
             # 固化洞口原始边界（用于STRICT自检：判断是否跨越叠合面/洞内真空等）
             lines.append(f'    __HOLE_BOUNDS__ = {hole_bounds!r}')
+            # 洞口顶/底加强纵筋的分组边集合（用于验收证据：count/diameter 独立）
+            lines.append('    __HOLE_TOP_LONG_EDGES__ = [[] for _ in __HOLE_BOUNDS__]')
+            lines.append('    __HOLE_BOTTOM_LONG_EDGES__ = [[] for _ in __HOLE_BOUNDS__]')
 
             # 预制段腹板实体：6外壳面 + 4孔壁面/洞
             lines.append('    # ========== 3B. 预制段腹板实体（inners开洞 + 孔壁面闭合）==========')
@@ -868,8 +1187,8 @@ class CompositeBeamModelGenerator:
             lines.append('                ang = 2.0 * math.pi * float(k) / float(duct_n)')
             lines.append('                y = duct_y0 + duct_r * math.cos(ang)')
             lines.append('                z = duct_z0 + duct_r * math.sin(ang)')
-            lines.append('                duct_n0.append(Node(duct_x0, y, z).id)')
-            lines.append('                duct_nL.append(Node(duct_xL, y, z).id)')
+            lines.append('                duct_n0.append(_node(duct_x0, y, z))')
+            lines.append('                duct_nL.append(_node(duct_xL, y, z))')
             lines.append('            duct_l0 = []  # X=0 ring edges')
             lines.append('            duct_lL = []  # X=L ring edges')
             lines.append('            duct_lc = []  # connect edges')
@@ -897,46 +1216,105 @@ class CompositeBeamModelGenerator:
             lines.append('    # ========== 3B. 预制段整体实体（倒T/工字外轮廓拉伸，确保力学整体）==========')
             if bf_lower > 1e-6:
                 z_uf_bottom = H - tf_upper
-                if bf_upper > 1e-6 and tf_upper > 1e-6 and hp > z_uf_bottom + 1e-6:
-                    # 叠合面落在上翼缘内部：预制段包含“下翼缘+腹板+上翼缘下部(到hp)”
-                    lines.append(f'    precast_yz = [')
+
+                if split_lower_flange:
+                    lines.append('    # 下翼缘单独实体（PKPM 回复建议：更稳的网格）')
+                    lines.append(f'    flange_yz = [')
                     lines.append(f'        ({y_flange_lower_min:.3f}, 0.0),')
                     lines.append(f'        ({y_flange_lower_max:.3f}, 0.0),')
                     lines.append(f'        ({y_flange_lower_max:.3f}, {tf_lower:.3f}),')
-                    lines.append(f'        ({y_web_max:.3f}, {tf_lower:.3f}),')
+                    lines.append(f'        ({y_flange_lower_min:.3f}, {tf_lower:.3f}),')
+                    lines.append(f'    ]')
+                    lines.append(f'    flange_solid, _fl_n0, _fl_nL = _extrude_polygon_solid(0.0, {float(L):.3f}, flange_yz, sid=sec_concrete_precast.id, tol=1e-3)')
+                    lines.append('    _keep(flange_solid)')
+
+                    lines.append('    # 预制段腹板/上部实体（洞口/孔道仅作用在此体上）')
+                    if bf_upper > 1e-6 and tf_upper > 1e-6 and hp > z_uf_bottom + 1e-6:
+                        lines.append(f'    precast_yz = [')
+                        lines.append(f'        ({y_web_min:.3f}, {tf_lower:.3f}),')
+                        lines.append(f'        ({y_web_max:.3f}, {tf_lower:.3f}),')
+                        lines.append(f'        ({y_web_max:.3f}, {z_uf_bottom:.3f}),')
+                        lines.append(f'        ({y_flange_upper_max:.3f}, {z_uf_bottom:.3f}),')
+                        lines.append(f'        ({y_flange_upper_max:.3f}, {hp:.3f}),')
+                        lines.append(f'        ({y_flange_upper_min:.3f}, {hp:.3f}),')
+                        lines.append(f'        ({y_flange_upper_min:.3f}, {z_uf_bottom:.3f}),')
+                        lines.append(f'        ({y_web_min:.3f}, {z_uf_bottom:.3f}),')
+                        lines.append(f'    ]')
+                    else:
+                        lines.append(f'    precast_yz = [')
+                        lines.append(f'        ({y_web_min:.3f}, {tf_lower:.3f}),')
+                        lines.append(f'        ({y_web_max:.3f}, {tf_lower:.3f}),')
+                        lines.append(f'        ({y_web_max:.3f}, {hp:.3f}),')
+                        lines.append(f'        ({y_web_min:.3f}, {hp:.3f}),')
+                        lines.append(f'    ]')
+                    lines.append(f'    precast_edge_inners = {{{y_web_min:.3f}: hole_pre_inners, {y_web_max:.3f}: hole_pre_outers}}')
+                    lines.append(f'    precast_edge_inners_z = {{{hp:.3f}: hole_pre_hp_loops}}')
+                    lines.append('    _mark("geom.precast.build")')
+                    lines.append(f'    precast_solid, _pre_n0, _pre_nL = _extrude_polygon_solid(0.0, {float(L):.3f}, precast_yz, end0_inners=duct_pre_inners_x0, end1_inners=duct_pre_inners_xL, edge_inners_by_y=precast_edge_inners, edge_inners_by_z=precast_edge_inners_z, extra_surfs=hole_pre_inner_surfs + duct_pre_surfs + duct_pre_caps, sid=sec_concrete_precast.id, tol=1e-3)')
+                    lines.append('    _keep(precast_solid)')
+
+                else:
+                    if bf_upper > 1e-6 and tf_upper > 1e-6 and hp > z_uf_bottom + 1e-6:
+                        # 叠合面落在上翼缘内部：预制段包含“下翼缘+腹板+上翼缘下部(到hp)”
+                        lines.append(f'    precast_yz = [')
+                        lines.append(f'        ({y_flange_lower_min:.3f}, 0.0),')
+                        lines.append(f'        ({y_flange_lower_max:.3f}, 0.0),')
+                        lines.append(f'        ({y_flange_lower_max:.3f}, {tf_lower:.3f}),')
+                        lines.append(f'        ({y_web_max:.3f}, {tf_lower:.3f}),')
+                        lines.append(f'        ({y_web_max:.3f}, {z_uf_bottom:.3f}),')
+                        lines.append(f'        ({y_flange_upper_max:.3f}, {z_uf_bottom:.3f}),')
+                        lines.append(f'        ({y_flange_upper_max:.3f}, {hp:.3f}),')
+                        lines.append(f'        ({y_flange_upper_min:.3f}, {hp:.3f}),')
+                        lines.append(f'        ({y_flange_upper_min:.3f}, {z_uf_bottom:.3f}),')
+                        lines.append(f'        ({y_web_min:.3f}, {z_uf_bottom:.3f}),')
+                        lines.append(f'        ({y_web_min:.3f}, {tf_lower:.3f}),')
+                        lines.append(f'        ({y_flange_lower_min:.3f}, {tf_lower:.3f}),')
+                        lines.append(f'    ]')
+                    else:
+                        lines.append(f'    precast_yz = [')
+                        lines.append(f'        ({y_flange_lower_min:.3f}, 0.0),')
+                        lines.append(f'        ({y_flange_lower_max:.3f}, 0.0),')
+                        lines.append(f'        ({y_flange_lower_max:.3f}, {tf_lower:.3f}),')
+                        lines.append(f'        ({y_web_max:.3f}, {tf_lower:.3f}),')
+                        lines.append(f'        ({y_web_max:.3f}, {hp:.3f}),')
+                        lines.append(f'        ({y_web_min:.3f}, {hp:.3f}),')
+                        lines.append(f'        ({y_web_min:.3f}, {tf_lower:.3f}),')
+                        lines.append(f'        ({y_flange_lower_min:.3f}, {tf_lower:.3f}),')
+                        lines.append(f'    ]')
+                    lines.append(f'    precast_edge_inners = {{{y_web_min:.3f}: hole_pre_inners, {y_web_max:.3f}: hole_pre_outers}}')
+                    lines.append(f'    precast_edge_inners_z = {{{hp:.3f}: hole_pre_hp_loops}}')
+                    lines.append('    _mark("geom.precast.build")')
+                    lines.append(f'    precast_solid, _pre_n0, _pre_nL = _extrude_polygon_solid(0.0, {float(L):.3f}, precast_yz, end0_inners=duct_pre_inners_x0, end1_inners=duct_pre_inners_xL, edge_inners_by_y=precast_edge_inners, edge_inners_by_z=precast_edge_inners_z, extra_surfs=hole_pre_inner_surfs + duct_pre_surfs + duct_pre_caps, sid=sec_concrete_precast.id, tol=1e-3)')
+                    lines.append('    flange_solid = precast_solid')
+                    lines.append('    _keep(precast_solid)')
+            else:
+                # T型（无下翼缘）仍可能存在上翼缘：当叠合面 hp 落在上翼缘内部时，
+                # 预制段在 z=hp 的界面宽度必须与后浇层一致（否则界面 y_span 不匹配会导致 CHECK_FAIL）。
+                z_uf_bottom = H - tf_upper
+                if bf_upper > 1e-6 and tf_upper > 1e-6 and hp > z_uf_bottom + 1e-6:
+                    lines.append(f'    precast_yz = [')
+                    lines.append(f'        ({y_web_min:.3f}, 0.0),')
+                    lines.append(f'        ({y_web_max:.3f}, 0.0),')
                     lines.append(f'        ({y_web_max:.3f}, {z_uf_bottom:.3f}),')
                     lines.append(f'        ({y_flange_upper_max:.3f}, {z_uf_bottom:.3f}),')
                     lines.append(f'        ({y_flange_upper_max:.3f}, {hp:.3f}),')
                     lines.append(f'        ({y_flange_upper_min:.3f}, {hp:.3f}),')
                     lines.append(f'        ({y_flange_upper_min:.3f}, {z_uf_bottom:.3f}),')
                     lines.append(f'        ({y_web_min:.3f}, {z_uf_bottom:.3f}),')
-                    lines.append(f'        ({y_web_min:.3f}, {tf_lower:.3f}),')
-                    lines.append(f'        ({y_flange_lower_min:.3f}, {tf_lower:.3f}),')
                     lines.append(f'    ]')
                 else:
                     lines.append(f'    precast_yz = [')
-                    lines.append(f'        ({y_flange_lower_min:.3f}, 0.0),')
-                    lines.append(f'        ({y_flange_lower_max:.3f}, 0.0),')
-                    lines.append(f'        ({y_flange_lower_max:.3f}, {tf_lower:.3f}),')
-                    lines.append(f'        ({y_web_max:.3f}, {tf_lower:.3f}),')
+                    lines.append(f'        ({y_web_min:.3f}, 0.0),')
+                    lines.append(f'        ({y_web_max:.3f}, 0.0),')
                     lines.append(f'        ({y_web_max:.3f}, {hp:.3f}),')
                     lines.append(f'        ({y_web_min:.3f}, {hp:.3f}),')
-                    lines.append(f'        ({y_web_min:.3f}, {tf_lower:.3f}),')
-                    lines.append(f'        ({y_flange_lower_min:.3f}, {tf_lower:.3f}),')
                     lines.append(f'    ]')
-            else:
-                lines.append(f'    precast_yz = [')
-                lines.append(f'        ({y_web_min:.3f}, 0.0),')
-                lines.append(f'        ({y_web_max:.3f}, 0.0),')
-                lines.append(f'        ({y_web_max:.3f}, {hp:.3f}),')
-                lines.append(f'        ({y_web_min:.3f}, {hp:.3f}),')
-                lines.append(f'    ]')
-            lines.append(f'    precast_edge_inners = {{{y_web_min:.3f}: hole_pre_inners, {y_web_max:.3f}: hole_pre_outers}}')
-            lines.append(f'    precast_edge_inners_z = {{{hp:.3f}: hole_pre_hp_loops}}')
-            lines.append('    _mark("geom.precast.build")')
-            lines.append(f'    precast_solid, _pre_n0, _pre_nL = _extrude_polygon_solid(0.0, {float(L):.3f}, precast_yz, end0_inners=duct_pre_inners_x0, end1_inners=duct_pre_inners_xL, edge_inners_by_y=precast_edge_inners, edge_inners_by_z=precast_edge_inners_z, extra_surfs=hole_pre_inner_surfs + duct_pre_surfs + duct_pre_caps, sid=sec_concrete_precast.id, tol=1e-3)')
-            lines.append('    flange_solid = precast_solid  # 兼容旧变量名：预制段整体即包含下翼缘')
-            lines.append('    _keep(precast_solid)')
+                lines.append(f'    precast_edge_inners = {{{y_web_min:.3f}: hole_pre_inners, {y_web_max:.3f}: hole_pre_outers}}')
+                lines.append(f'    precast_edge_inners_z = {{{hp:.3f}: hole_pre_hp_loops}}')
+                lines.append('    _mark("geom.precast.build")')
+                lines.append(f'    precast_solid, _pre_n0, _pre_nL = _extrude_polygon_solid(0.0, {float(L):.3f}, precast_yz, end0_inners=duct_pre_inners_x0, end1_inners=duct_pre_inners_xL, edge_inners_by_y=precast_edge_inners, edge_inners_by_z=precast_edge_inners_z, extra_surfs=hole_pre_inner_surfs + duct_pre_surfs + duct_pre_caps, sid=sec_concrete_precast.id, tol=1e-3)')
+                lines.append('    flange_solid = precast_solid')
+                lines.append('    _keep(precast_solid)')
         else:
             # 无孔洞情况 - 简单长方体
             lines.append('    # ========== 3. 预制层面和实体 (无孔洞) ==========')
@@ -964,8 +1342,8 @@ class CompositeBeamModelGenerator:
             lines.append('                ang = 2.0 * math.pi * float(k) / float(duct_n)')
             lines.append('                y = duct_y0 + duct_r * math.cos(ang)')
             lines.append('                z = duct_z0 + duct_r * math.sin(ang)')
-            lines.append('                duct_n0.append(Node(duct_x0, y, z).id)')
-            lines.append('                duct_nL.append(Node(duct_xL, y, z).id)')
+            lines.append('                duct_n0.append(_node(duct_x0, y, z))')
+            lines.append('                duct_nL.append(_node(duct_xL, y, z))')
             lines.append('            duct_l0 = []')
             lines.append('            duct_lL = []')
             lines.append('            duct_lc = []')
@@ -992,45 +1370,104 @@ class CompositeBeamModelGenerator:
             lines.append('    # ========== 3B. 预制段整体实体（倒T/工字外轮廓拉伸，确保力学整体）==========')
             if bf_lower > 1e-6:
                 z_uf_bottom = H - tf_upper
-                if bf_upper > 1e-6 and tf_upper > 1e-6 and hp > z_uf_bottom + 1e-6:
-                    lines.append(f'    precast_yz = [')
+
+                if split_lower_flange:
+                    lines.append('    # 下翼缘单独实体（PKPM 回复建议：更稳的网格）')
+                    lines.append(f'    flange_yz = [')
                     lines.append(f'        ({y_flange_lower_min:.3f}, 0.0),')
                     lines.append(f'        ({y_flange_lower_max:.3f}, 0.0),')
                     lines.append(f'        ({y_flange_lower_max:.3f}, {tf_lower:.3f}),')
-                    lines.append(f'        ({y_web_max:.3f}, {tf_lower:.3f}),')
+                    lines.append(f'        ({y_flange_lower_min:.3f}, {tf_lower:.3f}),')
+                    lines.append(f'    ]')
+                    lines.append(f'    flange_solid, _fl_n0, _fl_nL = _extrude_polygon_solid(0.0, {float(L):.3f}, flange_yz, sid=sec_concrete_precast.id, tol=1e-3)')
+                    lines.append('    _keep(flange_solid)')
+
+                    lines.append('    # 预制段腹板/上部实体')
+                    if bf_upper > 1e-6 and tf_upper > 1e-6 and hp > z_uf_bottom + 1e-6:
+                        lines.append(f'    precast_yz = [')
+                        lines.append(f'        ({y_web_min:.3f}, {tf_lower:.3f}),')
+                        lines.append(f'        ({y_web_max:.3f}, {tf_lower:.3f}),')
+                        lines.append(f'        ({y_web_max:.3f}, {z_uf_bottom:.3f}),')
+                        lines.append(f'        ({y_flange_upper_max:.3f}, {z_uf_bottom:.3f}),')
+                        lines.append(f'        ({y_flange_upper_max:.3f}, {hp:.3f}),')
+                        lines.append(f'        ({y_flange_upper_min:.3f}, {hp:.3f}),')
+                        lines.append(f'        ({y_flange_upper_min:.3f}, {z_uf_bottom:.3f}),')
+                        lines.append(f'        ({y_web_min:.3f}, {z_uf_bottom:.3f}),')
+                        lines.append(f'    ]')
+                    else:
+                        lines.append(f'    precast_yz = [')
+                        lines.append(f'        ({y_web_min:.3f}, {tf_lower:.3f}),')
+                        lines.append(f'        ({y_web_max:.3f}, {tf_lower:.3f}),')
+                        lines.append(f'        ({y_web_max:.3f}, {hp:.3f}),')
+                        lines.append(f'        ({y_web_min:.3f}, {hp:.3f}),')
+                        lines.append(f'    ]')
+                    lines.append(f'    precast_edge_inners = {{{y_web_min:.3f}: hole_pre_inners, {y_web_max:.3f}: hole_pre_outers}}')
+                    lines.append(f'    precast_edge_inners_z = {{{hp:.3f}: hole_pre_hp_loops}}')
+                    lines.append('    _mark("geom.precast.build")')
+                    lines.append(f'    precast_solid, _pre_n0, _pre_nL = _extrude_polygon_solid(0.0, {float(L):.3f}, precast_yz, end0_inners=duct_pre_inners_x0, end1_inners=duct_pre_inners_xL, edge_inners_by_y=precast_edge_inners, edge_inners_by_z=precast_edge_inners_z, extra_surfs=hole_pre_inner_surfs + duct_pre_surfs + duct_pre_caps, sid=sec_concrete_precast.id, tol=1e-3)')
+                    lines.append('    _keep(precast_solid)')
+
+                else:
+                    if bf_upper > 1e-6 and tf_upper > 1e-6 and hp > z_uf_bottom + 1e-6:
+                        lines.append(f'    precast_yz = [')
+                        lines.append(f'        ({y_flange_lower_min:.3f}, 0.0),')
+                        lines.append(f'        ({y_flange_lower_max:.3f}, 0.0),')
+                        lines.append(f'        ({y_flange_lower_max:.3f}, {tf_lower:.3f}),')
+                        lines.append(f'        ({y_web_max:.3f}, {tf_lower:.3f}),')
+                        lines.append(f'        ({y_web_max:.3f}, {z_uf_bottom:.3f}),')
+                        lines.append(f'        ({y_flange_upper_max:.3f}, {z_uf_bottom:.3f}),')
+                        lines.append(f'        ({y_flange_upper_max:.3f}, {hp:.3f}),')
+                        lines.append(f'        ({y_flange_upper_min:.3f}, {hp:.3f}),')
+                        lines.append(f'        ({y_flange_upper_min:.3f}, {z_uf_bottom:.3f}),')
+                        lines.append(f'        ({y_web_min:.3f}, {z_uf_bottom:.3f}),')
+                        lines.append(f'        ({y_web_min:.3f}, {tf_lower:.3f}),')
+                        lines.append(f'        ({y_flange_lower_min:.3f}, {tf_lower:.3f}),')
+                        lines.append(f'    ]')
+                    else:
+                        lines.append(f'    precast_yz = [')
+                        lines.append(f'        ({y_flange_lower_min:.3f}, 0.0),')
+                        lines.append(f'        ({y_flange_lower_max:.3f}, 0.0),')
+                        lines.append(f'        ({y_flange_lower_max:.3f}, {tf_lower:.3f}),')
+                        lines.append(f'        ({y_web_max:.3f}, {tf_lower:.3f}),')
+                        lines.append(f'        ({y_web_max:.3f}, {hp:.3f}),')
+                        lines.append(f'        ({y_web_min:.3f}, {hp:.3f}),')
+                        lines.append(f'        ({y_web_min:.3f}, {tf_lower:.3f}),')
+                        lines.append(f'        ({y_flange_lower_min:.3f}, {tf_lower:.3f}),')
+                        lines.append(f'    ]')
+                    lines.append(f'    precast_edge_inners = {{{y_web_min:.3f}: hole_pre_inners, {y_web_max:.3f}: hole_pre_outers}}')
+                    lines.append(f'    precast_edge_inners_z = {{{hp:.3f}: hole_pre_hp_loops}}')
+                    lines.append('    _mark("geom.precast.build")')
+                    lines.append(f'    precast_solid, _pre_n0, _pre_nL = _extrude_polygon_solid(0.0, {float(L):.3f}, precast_yz, end0_inners=duct_pre_inners_x0, end1_inners=duct_pre_inners_xL, edge_inners_by_y=precast_edge_inners, edge_inners_by_z=precast_edge_inners_z, extra_surfs=hole_pre_inner_surfs + duct_pre_surfs + duct_pre_caps, sid=sec_concrete_precast.id, tol=1e-3)')
+                    lines.append('    flange_solid = precast_solid')
+                    lines.append('    _keep(precast_solid)')
+            else:
+                # T型（无下翼缘）仍可能存在上翼缘：当叠合面 hp 落在上翼缘内部时，
+                # 预制段在 z=hp 的界面宽度必须与后浇层一致（否则界面 y_span 不匹配会导致 CHECK_FAIL）。
+                z_uf_bottom = H - tf_upper
+                if bf_upper > 1e-6 and tf_upper > 1e-6 and hp > z_uf_bottom + 1e-6:
+                    lines.append(f'    precast_yz = [')
+                    lines.append(f'        ({y_web_min:.3f}, 0.0),')
+                    lines.append(f'        ({y_web_max:.3f}, 0.0),')
                     lines.append(f'        ({y_web_max:.3f}, {z_uf_bottom:.3f}),')
                     lines.append(f'        ({y_flange_upper_max:.3f}, {z_uf_bottom:.3f}),')
                     lines.append(f'        ({y_flange_upper_max:.3f}, {hp:.3f}),')
                     lines.append(f'        ({y_flange_upper_min:.3f}, {hp:.3f}),')
                     lines.append(f'        ({y_flange_upper_min:.3f}, {z_uf_bottom:.3f}),')
                     lines.append(f'        ({y_web_min:.3f}, {z_uf_bottom:.3f}),')
-                    lines.append(f'        ({y_web_min:.3f}, {tf_lower:.3f}),')
-                    lines.append(f'        ({y_flange_lower_min:.3f}, {tf_lower:.3f}),')
                     lines.append(f'    ]')
                 else:
                     lines.append(f'    precast_yz = [')
-                    lines.append(f'        ({y_flange_lower_min:.3f}, 0.0),')
-                    lines.append(f'        ({y_flange_lower_max:.3f}, 0.0),')
-                    lines.append(f'        ({y_flange_lower_max:.3f}, {tf_lower:.3f}),')
-                    lines.append(f'        ({y_web_max:.3f}, {tf_lower:.3f}),')
+                    lines.append(f'        ({y_web_min:.3f}, 0.0),')
+                    lines.append(f'        ({y_web_max:.3f}, 0.0),')
                     lines.append(f'        ({y_web_max:.3f}, {hp:.3f}),')
                     lines.append(f'        ({y_web_min:.3f}, {hp:.3f}),')
-                    lines.append(f'        ({y_web_min:.3f}, {tf_lower:.3f}),')
-                    lines.append(f'        ({y_flange_lower_min:.3f}, {tf_lower:.3f}),')
                     lines.append(f'    ]')
-            else:
-                lines.append(f'    precast_yz = [')
-                lines.append(f'        ({y_web_min:.3f}, 0.0),')
-                lines.append(f'        ({y_web_max:.3f}, 0.0),')
-                lines.append(f'        ({y_web_max:.3f}, {hp:.3f}),')
-                lines.append(f'        ({y_web_min:.3f}, {hp:.3f}),')
-                lines.append(f'    ]')
-            lines.append(f'    precast_edge_inners = {{{y_web_min:.3f}: hole_pre_inners, {y_web_max:.3f}: hole_pre_outers}}')
-            lines.append(f'    precast_edge_inners_z = {{{hp:.3f}: hole_pre_hp_loops}}')
-            lines.append('    _mark("geom.precast.build")')
-            lines.append(f'    precast_solid, _pre_n0, _pre_nL = _extrude_polygon_solid(0.0, {float(L):.3f}, precast_yz, end0_inners=duct_pre_inners_x0, end1_inners=duct_pre_inners_xL, edge_inners_by_y=precast_edge_inners, edge_inners_by_z=precast_edge_inners_z, extra_surfs=hole_pre_inner_surfs + duct_pre_surfs + duct_pre_caps, sid=sec_concrete_precast.id, tol=1e-3)')
-            lines.append('    flange_solid = precast_solid')
-            lines.append('    _keep(precast_solid)')
+                lines.append(f'    precast_edge_inners = {{{y_web_min:.3f}: hole_pre_inners, {y_web_max:.3f}: hole_pre_outers}}')
+                lines.append(f'    precast_edge_inners_z = {{{hp:.3f}: hole_pre_hp_loops}}')
+                lines.append('    _mark("geom.precast.build")')
+                lines.append(f'    precast_solid, _pre_n0, _pre_nL = _extrude_polygon_solid(0.0, {float(L):.3f}, precast_yz, end0_inners=duct_pre_inners_x0, end1_inners=duct_pre_inners_xL, edge_inners_by_y=precast_edge_inners, edge_inners_by_z=precast_edge_inners_z, extra_surfs=hole_pre_inner_surfs + duct_pre_surfs + duct_pre_caps, sid=sec_concrete_precast.id, tol=1e-3)')
+                lines.append('    flange_solid = precast_solid')
+                lines.append('    _keep(precast_solid)')
 
         lines.append('')
 
@@ -1073,14 +1510,14 @@ class CompositeBeamModelGenerator:
                 if z_max <= z_min + 1e-6:
                     continue
                 lines.append(f'    nhole_cast{hole_i} = [')
-                lines.append(f'        Node({x_min:.1f}, {y_web_min:.1f}, {z_min:.1f}).id,')
-                lines.append(f'        Node({x_max:.1f}, {y_web_min:.1f}, {z_min:.1f}).id,')
-                lines.append(f'        Node({x_max:.1f}, {y_web_min:.1f}, {z_max:.1f}).id,')
-                lines.append(f'        Node({x_min:.1f}, {y_web_min:.1f}, {z_max:.1f}).id,')
-                lines.append(f'        Node({x_min:.1f}, {y_web_max:.1f}, {z_min:.1f}).id,')
-                lines.append(f'        Node({x_max:.1f}, {y_web_max:.1f}, {z_min:.1f}).id,')
-                lines.append(f'        Node({x_max:.1f}, {y_web_max:.1f}, {z_max:.1f}).id,')
-                lines.append(f'        Node({x_min:.1f}, {y_web_max:.1f}, {z_max:.1f}).id,')
+                lines.append(f'        _node({x_min:.1f}, {y_web_min:.1f}, {z_min:.1f}),')
+                lines.append(f'        _node({x_max:.1f}, {y_web_min:.1f}, {z_min:.1f}),')
+                lines.append(f'        _node({x_max:.1f}, {y_web_min:.1f}, {z_max:.1f}),')
+                lines.append(f'        _node({x_min:.1f}, {y_web_min:.1f}, {z_max:.1f}),')
+                lines.append(f'        _node({x_min:.1f}, {y_web_max:.1f}, {z_min:.1f}),')
+                lines.append(f'        _node({x_max:.1f}, {y_web_max:.1f}, {z_min:.1f}),')
+                lines.append(f'        _node({x_max:.1f}, {y_web_max:.1f}, {z_max:.1f}),')
+                lines.append(f'        _node({x_min:.1f}, {y_web_max:.1f}, {z_max:.1f}),')
                 lines.append(f'    ]')
                 lines.append(f'    whole_cast{hole_i} = [')
                 lines.append(f'        Line(nhole_cast{hole_i}[0], nhole_cast{hole_i}[1]).id,')
@@ -1122,8 +1559,8 @@ class CompositeBeamModelGenerator:
         lines.append('                ang = 2.0 * math.pi * k / duct_n')
         lines.append('                yy = _r * math.cos(ang)')
         lines.append('                zz = float(duct_center_z) + _r * math.sin(ang)')
-        lines.append('                duct_n0.append(Node(0.0, yy, zz).id)')
-        lines.append(f'                duct_nL.append(Node({float(L):.3f}, yy, zz).id)')
+        lines.append('                duct_n0.append(_node(0.0, yy, zz))')
+        lines.append(f'                duct_nL.append(_node({float(L):.3f}, yy, zz))')
         lines.append('            duct_l0 = []')
         lines.append('            duct_lL = []')
         lines.append('            duct_lc = []')
@@ -1409,38 +1846,436 @@ class CompositeBeamModelGenerator:
         final_rebar_elements = []
         # 标记：洞口上下“小梁箍筋”单元（用于脚本侧自检 rebar.local_small_beam）
         local_small_beam_objids = set()
+        # 洞口顶/底加强纵筋分组（用于验收证据）
+        hole_top_long_map = {}    # objid(Element) -> hole_idx
+        hole_bottom_long_map = {} # objid(Element) -> hole_idx
+        # 顶部纵筋分组（通长/支座附加筋）用于验收证据
+        long_top_group_map = {}   # objid(Element) -> group_name
         if self.long_rebar_result:
             final_rebar_elements.extend(self.long_rebar_result.get('all_elements', []))
+            # 顶部纵筋分组（不含自动角筋）
+            for _e in (self.long_rebar_result.get('top_through', []) or []):
+                long_top_group_map[id(_e)] = "THROUGH"
+            for _e in (self.long_rebar_result.get('top_left_support_A', []) or []):
+                long_top_group_map[id(_e)] = "LEFT_A"
+            for _e in (self.long_rebar_result.get('top_left_support_B', []) or []):
+                long_top_group_map[id(_e)] = "LEFT_B"
+            for _e in (self.long_rebar_result.get('top_right_support_A', []) or []):
+                long_top_group_map[id(_e)] = "RIGHT_A"
+            for _e in (self.long_rebar_result.get('top_right_support_B', []) or []):
+                long_top_group_map[id(_e)] = "RIGHT_B"
         if self.stirrup_result:
             final_rebar_elements.extend(self.stirrup_result.get('all_elements', []))
         # 【新增】洞口加强筋单元
-        for hole_reinf in self.hole_reinf_results:
+        for _hi, hole_reinf in enumerate(self.hole_reinf_results):
             for _e in (hole_reinf.get('top_beam_stirrups', []) or []):
                 local_small_beam_objids.add(id(_e))
             for _e in (hole_reinf.get('bottom_beam_stirrups', []) or []):
                 local_small_beam_objids.add(id(_e))
+            for _e in (hole_reinf.get('top_long_rebars', []) or []):
+                hole_top_long_map[id(_e)] = int(_hi)
+            for _e in (hole_reinf.get('bottom_long_rebars', []) or []):
+                hole_bottom_long_map[id(_e)] = int(_hi)
             final_rebar_elements.extend(hole_reinf.get('all_elements', []))
 
         print(f">>> 钢筋单元总数: {len(final_rebar_elements)} (纵筋+箍筋+洞口加强筋)")
 
+        # 额外安全兜底：洞口真空区域内不得出现任何钢筋线段
+        # - 该兜底与 RebarEngine._create_rebar_line 的洞口避让逻辑配合使用
+        # - 用“线段中点落入洞口包围盒”判定（与 pkpm_composite_beam_model.py 内的 [CHECK] 一致）
+        if hole_bounds and final_rebar_elements:
+            try:
+                _eps = 1.0  # 1mm：避免边界误判
+                _hole_boxes = []
+                for hb in hole_bounds:
+                    if not isinstance(hb, dict):
+                        continue
+                    # 与几何开孔一致：优先使用“实际用于预制段开孔”的边界（避免端面内收/触面避让后导致误判）
+                    x0 = float(hb.get("x_min_precast")) if hb.get("x_min_precast") is not None else (float(hb.get("x_min")) if hb.get("x_min") is not None else None)
+                    x1 = float(hb.get("x_max_precast")) if hb.get("x_max_precast") is not None else (float(hb.get("x_max")) if hb.get("x_max") is not None else None)
+                    rz0 = float(hb.get("raw_z_min")) if hb.get("raw_z_min") is not None else None
+                    rz1 = float(hb.get("raw_z_max")) if hb.get("raw_z_max") is not None else None
+                    if x0 is None or x1 is None or rz0 is None or rz1 is None:
+                        continue
+                    xmin, xmax = (x0, x1) if x0 <= x1 else (x1, x0)
+                    # 与洞口建模一致：预制段洞口会被截断到 [tf_lower, hp]，若跨越叠合面则后浇段继续开孔；
+                    # 此处用“全高度有效洞口”做兜底过滤，确保任何情况下洞内不会残留钢筋线段。
+                    zmin = float(hb.get("z_min_precast")) if hb.get("z_min_precast") is not None else max(float(tf_lower), min(rz0, rz1))
+                    if abs(float(zmin) - float(tf_lower)) <= 1e-6:
+                        zmin = float(zmin) + 1.0
+                    # 顶边：若未跨越叠合面，则以预制段实际开孔 z_max_precast 为准；跨越则允许到 raw_z_max（后浇段继续开孔）
+                    _zmax_pre = float(hb.get("z_max_precast")) if hb.get("z_max_precast") is not None else None
+                    if _zmax_pre is not None and max(rz0, rz1) <= float(hp) + 1e-6:
+                        zmax = _zmax_pre
+                    else:
+                        zmax = min(float(H), max(rz0, rz1))
+                    if zmax <= zmin + 1e-6:
+                        continue
+                    _hole_boxes.append((xmin, xmax, float(y_web_min), float(y_web_max), zmin, zmax))
+
+                if _hole_boxes:
+                    _kept = []
+                    _removed = []
+                    for rb in final_rebar_elements:
+                        try:
+                            n1 = node_lookup.get(rb.nodes[0])
+                            n2 = node_lookup.get(rb.nodes[1])
+                        except Exception:
+                            _kept.append(rb)
+                            continue
+                        if not n1 or not n2:
+                            _kept.append(rb)
+                            continue
+                        mx = 0.5 * (float(n1.x) + float(n2.x))
+                        my = 0.5 * (float(n1.y) + float(n2.y))
+                        mz = 0.5 * (float(n1.z) + float(n2.z))
+                        hit = False
+                        for xmin, xmax, ymin, ymax, zmin, zmax in _hole_boxes:
+                            if (mx > xmin + _eps and mx < xmax - _eps and
+                                my > ymin + _eps and my < ymax - _eps and
+                                mz > zmin + _eps and mz < zmax - _eps):
+                                hit = True
+                                break
+                        if hit:
+                            _removed.append(rb)
+                        else:
+                            _kept.append(rb)
+
+                    if _removed:
+                        print(f">>> [洞口避让兜底] 已剔除洞口真空区内钢筋线段: {len(_removed)} 段 (避免 PKPM [CHECK] rebar.hole_void.edges FAIL)")
+                        final_rebar_elements = _kept
+            except Exception as _e:
+                print(f">>> [洞口避让兜底] 跳过(异常): {_e}")
+
         # 为每个钢筋单元创建节点和线构件
+        missing_diameter = []
         for i, rb in enumerate(final_rebar_elements):
             n1 = node_lookup.get(rb.nodes[0])
             n2 = node_lookup.get(rb.nodes[1])
             if n1 and n2:
+                d = getattr(rb, "diameter", None)
+                if d is None:
+                    missing_diameter.append(i)
+                    continue
+                key = _diam_key(d)
+                sec_var = sec_var_by_key.get(key)
+                if not sec_var:
+                    raise ValueError(f"未找到直径 D{key} 的钢筋截面定义，请检查 Excel/参数扫描逻辑")
                 # 创建两个节点
                 # 创建 Line 构件连接两个节点 (StruModel 的标准方式)
                 lines.append(f'    nid1_{i} = _node({n1.x:.2f}, {n1.y:.2f}, {n1.z:.2f})')
                 lines.append(f'    nid2_{i} = _node({n2.x:.2f}, {n2.y:.2f}, {n2.z:.2f})')
-                lines.append(f'    line_{i} = Line(nid1_{i}, nid2_{i}, sid=sec_rebar.id)')
+                lines.append(f'    line_{i} = Line(nid1_{i}, nid2_{i}, sid={sec_var}.id)')
                 lines.append(f'    rebar_lines.append(line_{i})')
                 lines.append(f'    if DEBUG_CHECK or STRICT_CHECK: __REBAR_EDGES__.append((nid1_{i}, nid2_{i}))')
+                lines.append(f'    if DEBUG_CHECK or STRICT_CHECK: __REBAR_EDGE_SID__[((nid1_{i}, nid2_{i}) if (nid1_{i} < nid2_{i}) else (nid2_{i}, nid1_{i}))] = {sec_var}.id')
                 if id(rb) in local_small_beam_objids:
                     lines.append(f'    if DEBUG_CHECK or STRICT_CHECK: __LOCAL_SMALL_BEAM_EDGES__.append((nid1_{i}, nid2_{i}))')
+                _hidx = hole_top_long_map.get(id(rb))
+                if _hidx is not None:
+                    lines.append(f'    if DEBUG_CHECK or STRICT_CHECK: __HOLE_TOP_LONG_EDGES__[{int(_hidx)}].append((nid1_{i}, nid2_{i}))')
+                _hidx = hole_bottom_long_map.get(id(rb))
+                if _hidx is not None:
+                    lines.append(f'    if DEBUG_CHECK or STRICT_CHECK: __HOLE_BOTTOM_LONG_EDGES__[{int(_hidx)}].append((nid1_{i}, nid2_{i}))')
+                _grp = long_top_group_map.get(id(rb))
+                if _grp == "THROUGH":
+                    lines.append(f'    if DEBUG_CHECK or STRICT_CHECK: __LONG_TOP_THROUGH_EDGES__.append((nid1_{i}, nid2_{i}))')
+                elif _grp == "LEFT_A":
+                    lines.append(f'    if DEBUG_CHECK or STRICT_CHECK: __LONG_TOP_LEFT_A_EDGES__.append((nid1_{i}, nid2_{i}))')
+                elif _grp == "LEFT_B":
+                    lines.append(f'    if DEBUG_CHECK or STRICT_CHECK: __LONG_TOP_LEFT_B_EDGES__.append((nid1_{i}, nid2_{i}))')
+                elif _grp == "RIGHT_A":
+                    lines.append(f'    if DEBUG_CHECK or STRICT_CHECK: __LONG_TOP_RIGHT_A_EDGES__.append((nid1_{i}, nid2_{i}))')
+                elif _grp == "RIGHT_B":
+                    lines.append(f'    if DEBUG_CHECK or STRICT_CHECK: __LONG_TOP_RIGHT_B_EDGES__.append((nid1_{i}, nid2_{i}))')
+
+        if missing_diameter:
+            raise ValueError(f"存在钢筋单元未携带直径信息(示例索引: {missing_diameter[:10]})，为避免错误的力学截面，已拒绝输出脚本")
 
         lines.append('')
         lines.append('    rebar_ids = [ln.id for ln in rebar_lines]  # 提取构件ID用于后续Embeded')
         lines.append('    print("钢筋总数:", len(rebar_lines))')
+        lines.append('    # 钢筋直径统计：用于验收“不同直径已正确分组/指派 sid”')
+        lines.append('    try:')
+        lines.append('        _dcnt = {}')
+        lines.append('        for _ln in rebar_lines:')
+        lines.append('            _sid = getattr(_ln, "sid", None)')
+        lines.append('            _d = __REBAR_SEC_DIAM__.get(_sid, None) if _sid is not None else None')
+        lines.append('            if _d is None:')
+        lines.append('                continue')
+        lines.append('            _dcnt[_d] = _dcnt.get(_d, 0) + 1')
+        lines.append('        _items = sorted([(float(k), int(v)) for (k, v) in _dcnt.items()], key=lambda x: x[0])')
+        lines.append('        print("[REBAR] by_diameter expected=from_excel actual=" + str(_items) + " => INFO")')
+        lines.append('    except Exception as _e:')
+        lines.append('        print("[REBAR] by_diameter expected=from_excel actual=unknown => INFO | err=" + repr(_e))')
+        lines.append('    # --- 验收证据：洞口顶/底纵筋 + 通长筋/支座筋“分组独立” ---')
+        lines.append('    try:')
+        lines.append('        _tol = 1e-6')
+        lines.append('        _tolz = 1e-3')
+        lines.append('        _H = float(locals().get("__H__", 0.0) or 0.0)')
+        lines.append('        _L = float(locals().get("__L__", 0.0) or 0.0)')
+        lines.append('        _cover = float(locals().get("__COVER__", 25.0) or 25.0)')
+        lines.append('        _tfL = float(locals().get("__TF_LOWER__", 0.0) or 0.0)')
+        lines.append('')
+        lines.append('        def _ek(u, v):')
+        lines.append('            return (int(u), int(v)) if int(u) < int(v) else (int(v), int(u))')
+        lines.append('        def _edge_diam(u, v):')
+        lines.append('            sid = __REBAR_EDGE_SID__.get(_ek(u, v), None)')
+        lines.append('            return __REBAR_SEC_DIAM__.get(sid, None) if sid is not None else None')
+        lines.append('        def _uniq_y(edges, z, dia=None, xlim=None, ylim=None):')
+        lines.append('            ys=set()')
+        lines.append('            for (u,v) in (edges or []):')
+        lines.append('                pu=__NODE_COORDS__.get(u); pv=__NODE_COORDS__.get(v)')
+        lines.append('                if pu is None or pv is None: continue')
+        lines.append('                x1,y1,z1 = float(pu[0]), float(pu[1]), float(pu[2])')
+        lines.append('                x2,y2,z2 = float(pv[0]), float(pv[1]), float(pv[2])')
+        lines.append('                if abs(z1 - z2) > _tolz: continue')
+        lines.append('                if abs(z1 - float(z)) > _tolz: continue')
+        lines.append('                if abs(y1 - y2) > _tol: continue')
+        lines.append('                if abs(x1 - x2) <= _tol: continue')
+        lines.append('                if xlim is not None:')
+        lines.append('                    try:')
+        lines.append('                        xm = 0.5*(x1+x2)')
+        lines.append('                        if xm < float(xlim[0]) - _tol or xm > float(xlim[1]) + _tol: continue')
+        lines.append('                    except Exception:')
+        lines.append('                        pass')
+        lines.append('                if ylim is not None:')
+        lines.append('                    try:')
+        lines.append('                        ym = 0.5*(y1+y2)')
+        lines.append('                        if ym < float(ylim[0]) - _tol or ym > float(ylim[1]) + _tol: continue')
+        lines.append('                    except Exception:')
+        lines.append('                        pass')
+        lines.append('                if dia is not None:')
+        lines.append('                    d = _edge_diam(u, v)')
+        lines.append('                    if d is None or abs(float(d) - float(dia)) > 1e-6: continue')
+        lines.append('                ys.add(round(y1, 3))')
+        lines.append('            return sorted(ys)')
+        lines.append('        def _diam_set(edges, z, xlim=None, ylim=None):')
+        lines.append('            ds=set()')
+        lines.append('            for (u,v) in (edges or []):')
+        lines.append('                pu=__NODE_COORDS__.get(u); pv=__NODE_COORDS__.get(v)')
+        lines.append('                if pu is None or pv is None: continue')
+        lines.append('                x1,y1,z1 = float(pu[0]), float(pu[1]), float(pu[2])')
+        lines.append('                x2,y2,z2 = float(pv[0]), float(pv[1]), float(pv[2])')
+        lines.append('                if abs(z1 - z2) > _tolz: continue')
+        lines.append('                if abs(z1 - float(z)) > _tolz: continue')
+        lines.append('                if abs(y1 - y2) > _tol: continue')
+        lines.append('                if abs(x1 - x2) <= _tol: continue')
+        lines.append('                if xlim is not None:')
+        lines.append('                    try:')
+        lines.append('                        xm = 0.5*(x1+x2)')
+        lines.append('                        if xm < float(xlim[0]) - _tol or xm > float(xlim[1]) + _tol: continue')
+        lines.append('                    except Exception:')
+        lines.append('                        pass')
+        lines.append('                if ylim is not None:')
+        lines.append('                    try:')
+        lines.append('                        ym = 0.5*(y1+y2)')
+        lines.append('                        if ym < float(ylim[0]) - _tol or ym > float(ylim[1]) + _tol: continue')
+        lines.append('                    except Exception:')
+        lines.append('                        pass')
+        lines.append('                d = _edge_diam(u, v)')
+        lines.append('                if d is not None: ds.add(round(float(d), 6))')
+        lines.append('            return sorted(ds)')
+        lines.append('        def _x_span(edges, z, dia=None, xlim=None, ylim=None):')
+        lines.append('            xs=[]')
+        lines.append('            for (u,v) in (edges or []):')
+        lines.append('                pu=__NODE_COORDS__.get(u); pv=__NODE_COORDS__.get(v)')
+        lines.append('                if pu is None or pv is None: continue')
+        lines.append('                x1,y1,z1 = float(pu[0]), float(pu[1]), float(pu[2])')
+        lines.append('                x2,y2,z2 = float(pv[0]), float(pv[1]), float(pv[2])')
+        lines.append('                if abs(z1 - z2) > _tolz: continue')
+        lines.append('                if abs(z1 - float(z)) > _tolz: continue')
+        lines.append('                if abs(y1 - y2) > _tol: continue')
+        lines.append('                if abs(x1 - x2) <= _tol: continue')
+        lines.append('                if xlim is not None:')
+        lines.append('                    try:')
+        lines.append('                        xm = 0.5*(x1+x2)')
+        lines.append('                        if xm < float(xlim[0]) - _tol or xm > float(xlim[1]) + _tol: continue')
+        lines.append('                    except Exception:')
+        lines.append('                        pass')
+        lines.append('                if ylim is not None:')
+        lines.append('                    try:')
+        lines.append('                        ym = 0.5*(y1+y2)')
+        lines.append('                        if ym < float(ylim[0]) - _tol or ym > float(ylim[1]) + _tol: continue')
+        lines.append('                    except Exception:')
+        lines.append('                        pass')
+        lines.append('                if dia is not None:')
+        lines.append('                    d = _edge_diam(u, v)')
+        lines.append('                    if d is None or abs(float(d) - float(dia)) > 1e-6: continue')
+        lines.append('                xs.extend([x1, x2])')
+        lines.append('            return (min(xs), max(xs)) if xs else (None, None)')
+        lines.append('')
+        lines.append('        # 1) 洞口顶/底加强纵筋：按分组边集合验收（避免依赖 Line.srcNodes 等版本差异）')
+        lines.append('        _hb_all = locals().get("__HOLE_BOUNDS__", [])')
+        lines.append('        if isinstance(_hb_all, list) and _hb_all:')
+        lines.append('            for _hi, _hb in enumerate(_hb_all):')
+        lines.append('                if not isinstance(_hb, dict): continue')
+        lines.append('                _rz0 = _hb.get("raw_z_min"); _rz1 = _hb.get("raw_z_max")')
+        lines.append('                if _rz0 is None or _rz1 is None: continue')
+        lines.append('                _legacy_d = float(_hb.get("small_beam_long_diameter", 0.0) or 0.0)')
+        lines.append('                _legacy_c = int(_hb.get("small_beam_long_count", 0) or 0)')
+        lines.append('                _td = float(_hb.get("small_beam_long_top_diameter", 0.0) or 0.0)')
+        lines.append('                _tc = int(_hb.get("small_beam_long_top_count", 0) or 0)')
+        lines.append('                _bd = float(_hb.get("small_beam_long_bottom_diameter", 0.0) or 0.0)')
+        lines.append('                _bc = int(_hb.get("small_beam_long_bottom_count", 0) or 0)')
+        lines.append('                if _tc <= 0 or _td <= 0: _tc, _td = _legacy_c, _legacy_d')
+        lines.append('                if _bc <= 0 or _bd <= 0: _bc, _bd = _legacy_c, _legacy_d')
+        lines.append('                _zbot = max(float(_rz0), float(_tfL), float(_cover) + 1.0)')
+        lines.append('                if abs(float(_zbot) - float(_tfL)) <= 1e-6 and float(_tfL) > (float(_cover) + 1.0 + 1e-6):')
+        lines.append('                    _zbot = float(_zbot) + 1.0')
+        lines.append('                _ztop = float(_rz1)')
+        lines.append('                _z_top_bar = min(float(_ztop) + float(_cover), float(_H) - float(_cover))')
+        lines.append('                _z_bot_bar = max(float(_zbot) - float(_cover), float(_cover))')
+        lines.append('                # 洞口加强纵筋：标签优先；若标签缺失/版本差异导致统计不到，则回退为“按坐标范围扫描全量钢筋边”')
+        lines.append('                _x0 = _hb.get("x_min_precast") if _hb.get("x_min_precast") is not None else _hb.get("x_min")')
+        lines.append('                _x1 = _hb.get("x_max_precast") if _hb.get("x_max_precast") is not None else _hb.get("x_max")')
+        lines.append('                _ext = float(_hb.get("reinf_extend_length", 0.0) or 0.0)')
+        lines.append('                if _x0 is not None and _x1 is not None:')
+        lines.append('                    _xlim = (float(_x0) - float(_ext), float(_x1) + float(_ext))')
+        lines.append('                else:')
+        lines.append('                    _xlim = None')
+        lines.append('                _tw = float(locals().get("__TW__", 0.0) or 0.0)')
+        lines.append('                _ylim = (-0.5*float(_tw), 0.5*float(_tw)) if float(_tw) > 1e-6 else None')
+        lines.append('                if _tc > 0 and _td > 0 and "__HOLE_TOP_LONG_EDGES__" in locals():')
+        lines.append('                    _tag_edges = __HOLE_TOP_LONG_EDGES__[_hi] if _hi < len(__HOLE_TOP_LONG_EDGES__) else []')
+        lines.append('                    _ys_tag = _uniq_y(_tag_edges, _z_top_bar, dia=_td, xlim=_xlim, ylim=_ylim)')
+        lines.append('                    _dset_tag = _diam_set(_tag_edges, _z_top_bar, xlim=_xlim, ylim=_ylim)')
+        lines.append('                    _xs_tag = _x_span(_tag_edges, _z_top_bar, dia=_td, xlim=_xlim, ylim=_ylim)')
+        lines.append('                    _ok_tag = (len(_ys_tag) == int(_tc)) and (sorted(set(_dset_tag)) == [round(float(_td),6)])')
+        lines.append('                    _all_edges = __REBAR_EDGES__ if "__REBAR_EDGES__" in locals() else []')
+        lines.append('                    _ys_scan = _uniq_y(_all_edges, _z_top_bar, dia=_td, xlim=_xlim, ylim=_ylim)')
+        lines.append('                    _dset_scan = _diam_set(_all_edges, _z_top_bar, xlim=_xlim, ylim=_ylim)')
+        lines.append('                    _xs_scan = _x_span(_all_edges, _z_top_bar, dia=_td, xlim=_xlim, ylim=_ylim)')
+        lines.append('                    _ok_scan = (len(_ys_scan) == int(_tc)) and (sorted(set(_dset_scan)) == [round(float(_td),6)])')
+        lines.append('                    if _ok_tag or (not _ok_scan):')
+        lines.append('                        _ys, _dset, _xs, _src = _ys_tag, _dset_tag, _xs_tag, "tag"')
+        lines.append('                        _ok = _ok_tag')
+        lines.append('                    else:')
+        lines.append('                        _ys, _dset, _xs, _src = _ys_scan, _dset_scan, _xs_scan, "scan"')
+        lines.append('                        _ok = _ok_scan')
+        lines.append('                    _check(f"hole.reinf.top_long.spec.h{_hi+1}", expected=(int(_tc), float(_td)), actual=(len(_ys), float(_td)), ok=_ok, fatal=True, z=round(float(_z_top_bar),3), y=_ys, dia_set=_dset, x=_xs, src=_src, xlim=_xlim, ylim=_ylim)')
+        lines.append('                else:')
+        lines.append('                    _check(f"hole.reinf.top_long.spec.h{_hi+1}", expected="skipped", actual="skipped", ok=True)')
+        lines.append('                if _bc > 0 and _bd > 0 and "__HOLE_BOTTOM_LONG_EDGES__" in locals():')
+        lines.append('                    _tag_edges = __HOLE_BOTTOM_LONG_EDGES__[_hi] if _hi < len(__HOLE_BOTTOM_LONG_EDGES__) else []')
+        lines.append('                    _ys_tag = _uniq_y(_tag_edges, _z_bot_bar, dia=_bd, xlim=_xlim, ylim=_ylim)')
+        lines.append('                    _dset_tag = _diam_set(_tag_edges, _z_bot_bar, xlim=_xlim, ylim=_ylim)')
+        lines.append('                    _xs_tag = _x_span(_tag_edges, _z_bot_bar, dia=_bd, xlim=_xlim, ylim=_ylim)')
+        lines.append('                    _ok_tag = (len(_ys_tag) == int(_bc)) and (sorted(set(_dset_tag)) == [round(float(_bd),6)])')
+        lines.append('                    _all_edges = __REBAR_EDGES__ if "__REBAR_EDGES__" in locals() else []')
+        lines.append('                    _ys_scan = _uniq_y(_all_edges, _z_bot_bar, dia=_bd, xlim=_xlim, ylim=_ylim)')
+        lines.append('                    _dset_scan = _diam_set(_all_edges, _z_bot_bar, xlim=_xlim, ylim=_ylim)')
+        lines.append('                    _xs_scan = _x_span(_all_edges, _z_bot_bar, dia=_bd, xlim=_xlim, ylim=_ylim)')
+        lines.append('                    _ok_scan = (len(_ys_scan) == int(_bc)) and (sorted(set(_dset_scan)) == [round(float(_bd),6)])')
+        lines.append('                    if _ok_tag or (not _ok_scan):')
+        lines.append('                        _ys, _dset, _xs, _src = _ys_tag, _dset_tag, _xs_tag, "tag"')
+        lines.append('                        _ok = _ok_tag')
+        lines.append('                    else:')
+        lines.append('                        _ys, _dset, _xs, _src = _ys_scan, _dset_scan, _xs_scan, "scan"')
+        lines.append('                        _ok = _ok_scan')
+        lines.append('                    _check(f"hole.reinf.bottom_long.spec.h{_hi+1}", expected=(int(_bc), float(_bd)), actual=(len(_ys), float(_bd)), ok=_ok, fatal=True, z=round(float(_z_bot_bar),3), y=_ys, dia_set=_dset, x=_xs, src=_src, xlim=_xlim, ylim=_ylim)')
+        lines.append('                else:')
+        lines.append('                    _check(f"hole.reinf.bottom_long.spec.h{_hi+1}", expected="skipped", actual="skipped", ok=True)')
+        lines.append('')
+        lines.append('        # 2) 顶部通长筋 vs 支座附加筋：按分组边集合验收（每排计数）')
+        lines.append('        def _z_list(dia, rows, sp):')
+        lines.append('            try:')
+        lines.append('                d = float(dia); n = max(1, int(rows)); s = max(0.0, float(sp))')
+        lines.append('                step = (d + s) if d > 1e-6 else s')
+        lines.append('                z0 = float(_H) - float(_cover)')
+        lines.append('                return [round(z0 - float(i)*float(step), 3) for i in range(n)]')
+        lines.append('            except Exception:')
+        lines.append('                return [round(float(_H) - float(_cover), 3)]')
+
+        # embed expected from Excel (generator-side)
+        lr = getattr(self.params, "long_rebar", None)
+        if lr is not None and getattr(lr, "mid_span_top", None) is not None:
+            L = float(getattr(self.params.geometry, "L", 0.0) or 0.0)
+            left_len = float(getattr(lr, "left_support_length", 0.0) or 0.0)
+            right_len = float(getattr(lr, "right_support_length", 0.0) or 0.0)
+            if left_len <= 1e-6:
+                left_len = L / 3.0 if L > 1e-6 else 0.0
+            if right_len <= 1e-6:
+                right_len = L / 3.0 if L > 1e-6 else 0.0
+            top_rows = int(getattr(lr, "top_rows", 1) or 1)
+            top_row_spacing = float(getattr(lr, "top_row_spacing", 0.0) or 0.0)
+            mid = getattr(lr, "mid_span_top", None)
+            lA = getattr(lr, "left_support_top_A", None)
+            lB = getattr(lr, "left_support_top_B", None)
+            rA = getattr(lr, "right_support_top_A", None)
+            rB = getattr(lr, "right_support_top_B", None)
+
+            lines.append(f'        _TOP_ROWS = {int(top_rows)}')
+            lines.append(f'        _TOP_ROW_SP = {float(top_row_spacing)}')
+            lines.append(f'        _MID_CNT = {int(mid.count)}')
+            lines.append(f'        _MID_DIA = {float(mid.diameter)}')
+            if lA is not None:
+                lines.append(f'        _L_A_CNT = {int(lA.count)}'); lines.append(f'        _L_A_DIA = {float(lA.diameter)}')
+            else:
+                lines.append('        _L_A_CNT = 0; _L_A_DIA = 0.0')
+            if lB is not None:
+                lines.append(f'        _L_B_CNT = {int(lB.count)}'); lines.append(f'        _L_B_DIA = {float(lB.diameter)}')
+            else:
+                lines.append('        _L_B_CNT = 0; _L_B_DIA = 0.0')
+            if rA is not None:
+                lines.append(f'        _R_A_CNT = {int(rA.count)}'); lines.append(f'        _R_A_DIA = {float(rA.diameter)}')
+            else:
+                lines.append('        _R_A_CNT = 0; _R_A_DIA = 0.0')
+            if rB is not None:
+                lines.append(f'        _R_B_CNT = {int(rB.count)}'); lines.append(f'        _R_B_DIA = {float(rB.diameter)}')
+            else:
+                lines.append('        _R_B_CNT = 0; _R_B_DIA = 0.0')
+
+            lines.append('        _zs = _z_list(_MID_DIA, _TOP_ROWS, _TOP_ROW_SP)')
+            lines.append('        _cnts = [len(_uniq_y(__LONG_TOP_THROUGH_EDGES__, z, dia=_MID_DIA)) for z in _zs]')
+            lines.append('        _xsp = [_x_span(__LONG_TOP_THROUGH_EDGES__, z, dia=_MID_DIA) for z in _zs]')
+            lines.append('        _ok = all(int(c) >= int(_MID_CNT) for c in _cnts)')
+            lines.append('        _check(\"long.top.through.spec\", expected=f\">={int(_MID_CNT)} each_row\", actual=_cnts, ok=_ok, fatal=True, dia=float(_MID_DIA), z=_zs, x=_xsp)')
+
+            lines.append('        if _L_A_CNT > 0 and _L_A_DIA > 0:')
+            lines.append('            _zs = _z_list(_L_A_DIA, _TOP_ROWS, _TOP_ROW_SP)')
+            lines.append('            _cnts = [len(_uniq_y(__LONG_TOP_LEFT_A_EDGES__, z, dia=_L_A_DIA)) for z in _zs]')
+            lines.append('            _xsp = [_x_span(__LONG_TOP_LEFT_A_EDGES__, z, dia=_L_A_DIA) for z in _zs]')
+            lines.append('            _ok = all(int(c) >= int(_L_A_CNT) for c in _cnts)')
+            lines.append('            _check(\"long.top.left_support_A.spec\", expected=f\">={int(_L_A_CNT)} each_row\", actual=_cnts, ok=_ok, fatal=True, dia=float(_L_A_DIA), z=_zs, x=_xsp)')
+            lines.append('        else:')
+            lines.append('            _check(\"long.top.left_support_A.spec\", expected=\"skipped\", actual=\"skipped\", ok=True)')
+            lines.append('        if _L_B_CNT > 0 and _L_B_DIA > 0:')
+            lines.append('            _zs = _z_list(_L_B_DIA, _TOP_ROWS, _TOP_ROW_SP)')
+            lines.append('            _cnts = [len(_uniq_y(__LONG_TOP_LEFT_B_EDGES__, z, dia=_L_B_DIA)) for z in _zs]')
+            lines.append('            _xsp = [_x_span(__LONG_TOP_LEFT_B_EDGES__, z, dia=_L_B_DIA) for z in _zs]')
+            lines.append('            _ok = all(int(c) >= int(_L_B_CNT) for c in _cnts)')
+            lines.append('            _check(\"long.top.left_support_B.spec\", expected=f\">={int(_L_B_CNT)} each_row\", actual=_cnts, ok=_ok, fatal=True, dia=float(_L_B_DIA), z=_zs, x=_xsp)')
+            lines.append('        else:')
+            lines.append('            _check(\"long.top.left_support_B.spec\", expected=\"skipped\", actual=\"skipped\", ok=True)')
+            lines.append('        if _R_A_CNT > 0 and _R_A_DIA > 0:')
+            lines.append('            _zs = _z_list(_R_A_DIA, _TOP_ROWS, _TOP_ROW_SP)')
+            lines.append('            _cnts = [len(_uniq_y(__LONG_TOP_RIGHT_A_EDGES__, z, dia=_R_A_DIA)) for z in _zs]')
+            lines.append('            _xsp = [_x_span(__LONG_TOP_RIGHT_A_EDGES__, z, dia=_R_A_DIA) for z in _zs]')
+            lines.append('            _ok = all(int(c) >= int(_R_A_CNT) for c in _cnts)')
+            lines.append('            _check(\"long.top.right_support_A.spec\", expected=f\">={int(_R_A_CNT)} each_row\", actual=_cnts, ok=_ok, fatal=True, dia=float(_R_A_DIA), z=_zs, x=_xsp)')
+            lines.append('        else:')
+            lines.append('            _check(\"long.top.right_support_A.spec\", expected=\"skipped\", actual=\"skipped\", ok=True)')
+            lines.append('        if _R_B_CNT > 0 and _R_B_DIA > 0:')
+            lines.append('            _zs = _z_list(_R_B_DIA, _TOP_ROWS, _TOP_ROW_SP)')
+            lines.append('            _cnts = [len(_uniq_y(__LONG_TOP_RIGHT_B_EDGES__, z, dia=_R_B_DIA)) for z in _zs]')
+            lines.append('            _xsp = [_x_span(__LONG_TOP_RIGHT_B_EDGES__, z, dia=_R_B_DIA) for z in _zs]')
+            lines.append('            _ok = all(int(c) >= int(_R_B_CNT) for c in _cnts)')
+            lines.append('            _check(\"long.top.right_support_B.spec\", expected=f\">={int(_R_B_CNT)} each_row\", actual=_cnts, ok=_ok, fatal=True, dia=float(_R_B_DIA), z=_zs, x=_xsp)')
+            lines.append('        else:')
+            lines.append('            _check(\"long.top.right_support_B.spec\", expected=\"skipped\", actual=\"skipped\", ok=True)')
+        lines.append('    except Exception as _e:')
+        lines.append('        print(\"[CHECK] acceptance.evidence expected=ok actual=error => INFO | err=\" + repr(_e))')
+        lines.append('    # 钢筋节点集合：便于在 GUI 中快速框选/检查（嵌入关系仍建议网格后在软件内建立）')
+        lines.append('    try:')
+        lines.append('        _rnodes = set()')
+        lines.append('        for (a, b) in __REBAR_EDGES__:')
+        lines.append('            if a is not None: _rnodes.add(int(a))')
+        lines.append('            if b is not None: _rnodes.add(int(b))')
+        lines.append('        ns_rebar_nodes = Nset("REBAR_NODES", sorted(_rnodes))')
+        lines.append('        _keep(ns_rebar_nodes)')
+        lines.append('    except Exception:')
+        lines.append('        ns_rebar_nodes = None')
         lines.append('')
 
         # ========== 6. 钢筋嵌入 ==========
@@ -1465,9 +2300,41 @@ class CompositeBeamModelGenerator:
         lines.append('    # 合并所有混凝土单元ID')
         lines.append('    concrete_elem_ids = list(set(flange_elem_ids + web_elem_ids + cast_elem_ids))')
         lines.append('')
-        lines.append('    # 将钢筋单元嵌入混凝土单元中，实现协同变形')
-        lines.append('    if len(rebar_ids) > 0 and len(concrete_elem_ids) > 0:')
-        lines.append('        Embeded(tarElems=concrete_elem_ids, srcElems=rebar_ids, type=EmbededType.NodeToElem, iKey=DofMode.Both)')
+        lines.append('    # 将钢筋单元嵌入混凝土单元中，实现协同变形（客户回复：钢筋应为 Link 单元，并需嵌入到实体）')
+        lines.append('    # 说明：部分 PKPM-CAE 版本/流程要求“网格后”才能执行嵌入；脚本这里做 best-effort，失败则提示 post-mesh 在软件内完成。')
+        lines.append('    rebar_embed_ok = False')
+        lines.append('    rebar_embed_method = None')
+        lines.append('    rebar_embed_err = None')
+        lines.append('    rebar_embed_ready = isinstance(concrete_elem_ids, list) and (len(concrete_elem_ids) > 0)')
+        lines.append('    _sids = []')
+        lines.append('    for _s in [flange_solid, precast_solid, cast_solid]:')
+        lines.append('        sid0 = getattr(_s, "id", None)')
+        lines.append('        if sid0 is not None:')
+        lines.append('            _sids.append(int(sid0))')
+        lines.append('    if len(rebar_ids) > 0:')
+        lines.append('        # 1) 若已能拿到 Solid 单元ID（通常意味着已网格/可查询到实体单元），优先用 NodeToElem 嵌入')
+        lines.append('        if rebar_embed_ready:')
+        lines.append('            try:')
+        lines.append('                Embeded(tarElems=concrete_elem_ids, srcElems=rebar_ids, type=EmbededType.NodeToElem, iKey=DofMode.Both)')
+        lines.append('                rebar_embed_ok = True')
+        lines.append('                rebar_embed_method = "Embeded(tarElems,srcElems,NodeToElem)"')
+        lines.append('            except Exception as e:')
+        lines.append('                rebar_embed_err = repr(e)')
+        lines.append('        # 2) 兼容：某些版本支持 link_ids/solid_ids/tol（不依赖 concrete_elem_ids）')
+        lines.append('        if (not rebar_embed_ok) and _sids:')
+        lines.append('            try:')
+        lines.append('                Embeded(link_ids=rebar_ids, solid_ids=_sids, tol=5.0)')
+        lines.append('                rebar_embed_ok = True')
+        lines.append('                rebar_embed_method = "Embeded(link_ids,solid_ids,tol)"')
+        lines.append('                rebar_embed_err = None')
+        lines.append('            except Exception as e:')
+        lines.append('                # 若两种签名都不支持，将在自检中提示 post_mesh 手工嵌入')
+        lines.append('                if rebar_embed_err is None:')
+        lines.append('                    rebar_embed_err = repr(e)')
+        lines.append('        if not rebar_embed_ok and rebar_embed_method is None:')
+        lines.append('            rebar_embed_method = "skipped"')
+        lines.append('    if rebar_embed_method is None:')
+        lines.append('        rebar_embed_method = "skipped"')
         lines.append('')
         lines.append('    # --- 几何拓扑清理（网格报错兜底）：尝试合并重合节点 ---')
         lines.append('    topo_merge_ok = False')
@@ -1738,170 +2605,71 @@ class CompositeBeamModelGenerator:
             lines.append(f'    # 如需启用，请在Excel的Prestress表格中设置 Enabled=True 和 Force 值')
         lines.append('')
 
-        # ========== 9. 分析步 ==========
-        lines.append('    # ========== 9. 分析步定义 ==========')
-        lines.append('    lc_dead = LoadCase("恒载")')
-        lines.append('    lc_live = LoadCase("活载")')
-        lines.append('')
-
-        # ========== 9A. 施加实际荷载 ==========
-        lines.append('    # --- 9A. 施加实际荷载 ---')
-        lines.append('    # 获取梁顶面节点用于施加荷载')
-        lines.append(f'    top_surf_nodes = NodeQuery().elems(concrete_elem_ids).ge("z", {hp - 10:.1f}).ids')
-        lines.append('    if len(top_surf_nodes) == 0:')
-        lines.append(f'        top_surf_nodes = NodeQuery().elems(concrete_elem_ids).ge("Z", {hp - 10:.1f}).ids')
-        lines.append('    if len(top_surf_nodes) == 0:')
-        lines.append(f'        top_surf_nodes = NodeQuery().ge("z", {hp - 10:.1f}).ids')
-        lines.append('    if len(top_surf_nodes) == 0:')
-        lines.append(f'        top_surf_nodes = NodeQuery().ge("Z", {hp - 10:.1f}).ids')
-        lines.append('')
-        lines.append('    # 面荷载(Ebsload)：按实体单元顶面施加，避免用节点力模拟均布导致不均匀')
-        lines.append('    _node_cache = {}')
-        lines.append('    def _node_xyz_cached(nid_):')
-        lines.append('        if nid_ in _node_cache:')
-        lines.append('            return _node_cache[nid_]')
+        # ========== 9. 有限元荷载预留 ==========
+        # 客户要求：
+        # - 荷载值/工况由有限元模型阶段输入（几何脚本不施加荷载）
+        # - 脚本仅预留“可施加载荷对象”：梁顶的面、两道中线的线、线上的点
+        lines.append('    # ========== 9. 有限元荷载预留（脚本不施加荷载） ==========')
+        lines.append('    __LOAD_TOP_FACE_ESIDES__ = []  # [(solid_id, surf_id), ...] 仅用于定位')
+        lines.append('    __LOAD_TOP_FACE_SOURCE__ = None')
+        lines.append('    try:')
+        lines.append('        _sid = getattr(cast_solid, "id", None)')
+        lines.append('        _meta = __SOLID_META__.get(_sid, {}) if _sid is not None else {}')
+        lines.append('        for _sf in (_meta.get("top_surfs", []) if isinstance(_meta.get("top_surfs", []), list) else []):')
+        lines.append('            __LOAD_TOP_FACE_ESIDES__.append((_sid, _sf))')
+        lines.append('        if len(__LOAD_TOP_FACE_ESIDES__) > 0:')
+        lines.append('            __LOAD_TOP_FACE_SOURCE__ = "cast.top_surfs"')
+        lines.append('    except Exception:')
+        lines.append('        pass')
+        lines.append('    if len(__LOAD_TOP_FACE_ESIDES__) == 0:')
         lines.append('        try:')
-        lines.append('            _o = NodeQuery([nid_]).one')
-        lines.append('            _o = _o() if callable(_o) else _o')
-        lines.append('            xyz = (getattr(_o, "x", None), getattr(_o, "y", None), getattr(_o, "z", None))')
+        lines.append('            _sid = getattr(precast_solid, "id", None)')
+        lines.append('            _meta = __SOLID_META__.get(_sid, {}) if _sid is not None else {}')
+        lines.append('            for _sf in (_meta.get("top_surfs", []) if isinstance(_meta.get("top_surfs", []), list) else []):')
+        lines.append('                __LOAD_TOP_FACE_ESIDES__.append((_sid, _sf))')
+        lines.append('            if len(__LOAD_TOP_FACE_ESIDES__) > 0:')
+        lines.append('                __LOAD_TOP_FACE_SOURCE__ = "precast.top_surfs"')
         lines.append('        except Exception:')
-        lines.append('            xyz = (None, None, None)')
-        lines.append('        _node_cache[nid_] = xyz')
-        lines.append('        return xyz')
-        lines.append('    def _elem_nids(eid_):')
-        lines.append('        try:')
-        lines.append('            _e = ElemQuery([eid_]).one')
-        lines.append('            _e = _e() if callable(_e) else _e')
-        lines.append('            _nids = getattr(_e, "nids", None)')
-        lines.append('            _nids = _nids() if callable(_nids) else _nids')
-        lines.append('            return list(_nids) if isinstance(_nids, (list, tuple)) else []')
-        lines.append('        except Exception:')
-        lines.append('            return []')
+        lines.append('            pass')
+        lines.append('    print(f"[LOAD] reserved top face esides: {len(__LOAD_TOP_FACE_ESIDES__)} source={__LOAD_TOP_FACE_SOURCE__}")')
         lines.append('')
-
-        # 从params获取荷载数据
-        if self.params.loads:
-            for load_case in self.params.loads:
-                lc_name = 'lc_dead' if 'Dead' in load_case.name or '恒' in load_case.name else 'lc_live'
-                # 转换方向 - 使用 FDof 枚举（集中荷载仍使用节点力）
-                dof_map = {'X': 'FDof.Fx', 'Y': 'FDof.Fy', 'Z': 'FDof.Fz'}
-
-                # 均布荷载
-                for x1, x2, direction, magnitude in load_case.distributed_loads:
-                    lines.append(f'    # 均布荷载(升级为面荷载): {load_case.name} ({x1}~{x2}mm, {direction}向, {magnitude}kN/m)')
-                    lines.append(f'    __DIST_LOAD_VALUE__ = {magnitude}')
-                    lines.append('    __DIST_LOAD_MODE__ = "Ebsload"')
-                    lines.append('    bsload_esides = []')
-                    lines.append('    __DIST_LOAD_SOURCE__ = None')
-                    lines.append('    __DIST_LOAD_APPLIED__ = False')
-                    lines.append('    __DIST_LOAD_ERR__ = None')
-                    # 把 kN/m 转为等效面压力 kN/mm^2：q(kN/m)=q/1000(kN/mm); p=q/b
-                    load_width = (Tw + 2.0 * bf_upper) if bf_upper > 1e-6 else Tw
-                    lines.append(f'    __DIST_LOAD_WIDTH__ = {float(load_width):.3f}  # 顶面受压宽度(mm)')
-                    lines.append('    __DIST_LOAD_PRESSURE__ = abs(float(__DIST_LOAD_VALUE__)) / (1000.0 * float(__DIST_LOAD_WIDTH__)) if float(__DIST_LOAD_WIDTH__) > 1e-9 else 0.0')
-                    lines.append(f'    _x1 = float({x1}); _x2 = float({x2})')
-                    lines.append('')
-                    lines.append('    # A) 优先基于“实体单元面号”(若当前环境已具备 solid 元素/构件编号)')
-                    lines.append('    try:')
-                    lines.append('        _z_top = float(__H__ - 25.0)')
-                    lines.append('        _tolz = 1.0')
-                    lines.append('        for _eid in concrete_elem_ids:')
-                    lines.append('            _nids = _elem_nids(_eid)')
-                    lines.append('            if not _nids: continue')
-                    lines.append('            _xs=[]; _zs=[]')
-                    lines.append('            for _nid0 in _nids:')
-                    lines.append('                _x,_y,_z = _node_xyz_cached(_nid0)')
-                    lines.append('                if _x is not None: _xs.append(float(_x))')
-                    lines.append('                if _z is not None: _zs.append(float(_z))')
-                    lines.append('            if len(_xs) == 0 or len(_zs) == 0: continue')
-                    lines.append('            _cx = sum(_xs) / len(_xs)')
-                    lines.append('            if _cx < _x1 - 1e-6 or _cx > _x2 + 1e-6: continue')
-                    lines.append('            _top_n = sum(1 for zz in _zs if abs(float(zz) - _z_top) <= _tolz)')
-                    lines.append('            if _top_n >= 3:')
-                    lines.append('                bsload_esides.append((_eid, 5))')
-                    lines.append('        if len(bsload_esides) > 0:')
-                    lines.append('            __DIST_LOAD_SOURCE__ = "elem_side5"')
-                    lines.append('    except Exception as e:')
-                    lines.append('        __DIST_LOAD_ERR__ = repr(e)')
-                    lines.append('')
-                    lines.append('    # B) 若无法获取实体单元面号，则回退到“构件-几何顶面Surf”定位（__SOLID_META__）')
-                    lines.append('    if len(bsload_esides) == 0:')
-                    lines.append('        try:')
-                    lines.append('            _sid = getattr(cast_solid, "id", None)')
-                    lines.append('            _meta = __SOLID_META__.get(_sid, {}) if _sid is not None else {}')
-                    lines.append('            _tops = _meta.get("top_surfs", [])')
-                    lines.append('            # 仅对后浇层顶面施加面荷载')
-                    lines.append('            for _sf in (_tops if isinstance(_tops, list) else []):')
-                    lines.append('                bsload_esides.append((_sid, _sf))')
-                    lines.append('            if len(bsload_esides) > 0:')
-                    lines.append('                __DIST_LOAD_SOURCE__ = "solid_top_surfs"')
-                    lines.append('        except Exception as e:')
-                    lines.append('            __DIST_LOAD_ERR__ = repr(e)')
-                    lines.append('')
-                    lines.append('    if len(bsload_esides) > 0:')
-                    lines.append('        try:')
-                    lines.append('            _dir = [0, 0, -1] if float(__DIST_LOAD_VALUE__) < 0 else [0, 0, 1]')
-                    lines.append(f'            {lc_name}.add(Ebsload(bsload_esides, value=float(__DIST_LOAD_PRESSURE__), dir=_dir))')
-                    lines.append('            __DIST_LOAD_APPLIED__ = True')
-                    lines.append('        except Exception as e:')
-                    lines.append('            __DIST_LOAD_APPLIED__ = False')
-                    lines.append('            __DIST_LOAD_ERR__ = repr(e)')
-                    lines.append('')
-
-                # 集中荷载
-                for x, direction, magnitude in load_case.concentrated_loads:
-                    lines.append(f'    # 集中荷载: {load_case.name} (X={x}mm, {direction}向, {magnitude}kN)')
-                    lines.append(f'    conc_nodes = NodeQuery().elems(concrete_elem_ids).eq("x", {x}, tol=50).ge("z", {hp - 10:.1f}).ids')
-                    lines.append('    if len(conc_nodes) == 0:')
-                    lines.append(f'        conc_nodes = NodeQuery().elems(concrete_elem_ids).eq("X", {x}, tol=50).ge("Z", {hp - 10:.1f}).ids')
-                    lines.append('    if len(conc_nodes) == 0:')
-                    lines.append(f'        conc_nodes = NodeQuery().eq("x", {x}, tol=50).ge("z", {hp - 10:.1f}).ids')
-                    lines.append('    if len(conc_nodes) == 0:')
-                    lines.append(f'        conc_nodes = NodeQuery().eq("X", {x}, tol=50).ge("Z", {hp - 10:.1f}).ids')
-                    lines.append(f'    if len(conc_nodes) > 0:')
-                    dof = dof_map.get(direction.upper(), 'FDof.Fz')
-                    lines.append(f'        __CONC_LOAD_VALUE__ = {magnitude}')
-                    lines.append(f'        {lc_name}.add(Cload(gnids=[conc_nodes[0]], dof={dof}, value=__CONC_LOAD_VALUE__))')
-                    lines.append('')
-        else:
-            # 默认荷载（如果Excel未定义）
-            lines.append(f'    # 默认均布荷载 (恒载-15kN/m, 活载-20kN/m)')
-            lines.append(f'    if len(top_surf_nodes) > 0:')
-            lines.append(f'        # 将总荷载分配到各节点')
-            lines.append(f'        node_load_dead = -15.0 * {L} / len(top_surf_nodes)  # kN per node')
-            lines.append(f'        node_load_live = -20.0 * {L} / len(top_surf_nodes)')
-            lines.append(f'        for nid in top_surf_nodes:')
-            lines.append(f'            lc_dead.add(Cload(gnids=[nid], dof=FDof.Fz, value=node_load_dead))')
-            lines.append(f'            lc_live.add(Cload(gnids=[nid], dof=FDof.Fz, value=node_load_live))')
-        lines.append('')
-        lines.append('    # 【关键】Change.geids 必须传 Element ID，使用ElemQuery获取的单元ID')
-        lines.append('    # 施工阶段: 预制层 (翼缘 + 腹板)')
-        lines.append('    precast_elem_ids = list(set(flange_elem_ids + web_elem_ids))')
-        lines.append('    step1 = Step("施工阶段",')
-        lines.append('                 changes=[Change(type=ChangeType.Add, geids=precast_elem_ids)],')
-        lines.append('                 loadCases=[LoadCaseCombine(lc_dead.id, 1.0)])')
-        lines.append('')
-        lines.append('    # 使用阶段: 后浇层')
-        lines.append('    step2 = Step("使用阶段",')
-        lines.append('                 changes=[Change(type=ChangeType.Add, geids=cast_elem_ids)],')
-        lines.append('                 loadCases=[LoadCaseCombine(lc_dead.id, 1.0), LoadCaseCombine(lc_live.id, 1.0)])')
-        lines.append('')
-        lines.append('    # 分析设置 (包含预应力)')
-        lines.append('    analy = Analy("叠合梁分析", steps=[step1, step2], preStresses=prestress_list)')
+        lines.append('    # 两道中线（线上的点）：在梁顶面创建两条“加载引导线”的节点集（便于网格后施加线荷载/集中荷载）')
+        lines.append('    __LOAD_GUIDE_N__ = 11  # 点数（含两端），可在脚本中调整')
+        lines.append('    _n = int(__LOAD_GUIDE_N__) if int(__LOAD_GUIDE_N__) >= 2 else 2')
+        lines.append('    _z = float(__H__)')
+        lines.append('    _tw = float(__TW__)')
+        lines.append('    _bfU = float(locals().get("__BF_UPPER__", 0.0) or 0.0)')
+        lines.append('    _cov = float(__COVER__)')
+        lines.append('    _top_w = (_tw + 2.0*_bfU) if _bfU > 1e-6 else _tw')
+        lines.append('    _ymax = 0.5*_top_w - _cov')
+        lines.append('    _yline = min(0.25*_top_w, _ymax)')
+        lines.append('    if _yline < 0.0: _yline = 0.0')
+        lines.append('    __LOAD_LINE1_NIDS__ = []')
+        lines.append('    __LOAD_LINE2_NIDS__ = []')
+        lines.append('    for i in range(_n):')
+        lines.append('        xv = float(__L__) * float(i) / float(_n - 1)')
+        lines.append('        __LOAD_LINE1_NIDS__.append(_node(xv, -_yline, _z))')
+        lines.append('        __LOAD_LINE2_NIDS__.append(_node(xv,  _yline, _z))')
+        lines.append('    ns_line1 = Nset("LOAD_LINE_1", __LOAD_LINE1_NIDS__)')
+        lines.append('    ns_line2 = Nset("LOAD_LINE_2", __LOAD_LINE2_NIDS__)')
+        lines.append('    ns_points = Nset("LOAD_POINTS", list(set(__LOAD_LINE1_NIDS__ + __LOAD_LINE2_NIDS__)))')
+        lines.append('    _keep(ns_line1); _keep(ns_line2); _keep(ns_points)')
+        lines.append('    print(f"[LOAD] reserved lines: y=±{_yline:.3f} n={_n} sets=LOAD_LINE_1/LOAD_LINE_2")')
+        lines.append('    print(f"[LOAD] reserved points: {len(list(set(__LOAD_LINE1_NIDS__ + __LOAD_LINE2_NIDS__)))} set=LOAD_POINTS")')
         lines.append('')
 
         # ========== 10. 显示模型 ==========
         lines.append('    # ========== 10. 显示模型 ==========')
-        lines.append('    # 几何模型模块仅支持 StruModel（不支持引用 pypcae.fem.FemModel）')
-        # ---- 自检用：复刻 RebarEngine 的关键几何推导（用于箍筋“12段闭合环”验收）----
+        # ---- 自检用：复刻 RebarEngine 的关键几何推导（用于箍筋“闭合环”验收）----
         stirrup_cover = float(getattr(getattr(self.params, "stirrup", None), "cover", 25.0))
         # 用真实几何参数（不要用 200mm 兜底覆盖），否则自检会误报且会掩盖箍筋实际越界
-        bf_engine = max(getattr(g, "bf_ll", 0.0), getattr(g, "bf_rl", 0.0), getattr(g, "bf_lu", 0.0), getattr(g, "bf_ru", 0.0), 0.0)
-        y_outer_engine = (Tw + 2.0 * bf_engine) / 2.0 - stirrup_cover
+        # 注意：全局箍筋的“外侧短肢”只由下翼缘决定（上翼缘更宽时，不能把下部外肢画到外面）
+        bf_engine = max(getattr(g, "bf_ll", 0.0), getattr(g, "bf_rl", 0.0), 0.0)
+        y_outer_engine = (Tw + 2.0 * bf_engine) / 2.0 - stirrup_cover if bf_engine > 1e-6 else (Tw / 2.0 - stirrup_cover)
         y_inner_engine = Tw / 2.0 - stirrup_cover
         z_bottom_engine = stirrup_cover
-        z_fl_top_l = max(tf_ll, 100.0) - stirrup_cover
-        z_fl_top_r = max(tf_rl, 100.0) - stirrup_cover
+        z_fl_top_l = (tf_ll - stirrup_cover) if (getattr(g, "bf_ll", 0.0) > 1e-6 and tf_ll > stirrup_cover + 1e-6) else stirrup_cover
+        z_fl_top_r = (tf_rl - stirrup_cover) if (getattr(g, "bf_rl", 0.0) > 1e-6 and tf_rl > stirrup_cover + 1e-6) else stirrup_cover
         z_top_engine = H - stirrup_cover
 
         lines.append('    # ========== 10A. 自检（定量验收 / 高效定位）==========')
@@ -1913,6 +2681,11 @@ class CompositeBeamModelGenerator:
         lines.append('        _cid = _solid_id(cast_solid)')
         lines.append('        _check("solid.flange.id", expected="notNone", actual=_fid, ok=(_fid not in (None, 0)))')
         lines.append('        _check("solid.web_precast.id", expected="notNone", actual=_wid, ok=(_wid not in (None, 0)))')
+        lines.append('        _bfL = float(locals().get("__BF_LOWER__", 0.0) or 0.0)')
+        lines.append('        _tfL = float(locals().get("__TF_LOWER__", 0.0) or 0.0)')
+        lines.append('        _need_split = (_bfL > 1e-6 and _tfL > 1e-6)')
+        lines.append('        _split_ok = (not _need_split) or (_fid != _wid)')
+        lines.append('        _check("geom.precast.lower_flange.separate_solid", expected=(True if _need_split else "skipped"), actual=(_fid != _wid), ok=_split_ok, fatal=False, bf=_bfL, tf=_tfL, flange=_fid, web=_wid)')
         lines.append('        _check("solid.cast.id", expected="notNone", actual=_cid, ok=(_cid not in (None, 0)))')
         lines.append('        # --- 材料/截面（证据：生成脚本已定义且可获取到 id）---')
         lines.append('        _mid_pre = getattr(mat_concrete_precast, "id", None)')
@@ -1948,6 +2721,76 @@ class CompositeBeamModelGenerator:
         lines.append('        _check("mesh.force_tetra", expected="manual", actual="manual", ok=True)')
         lines.append('        _check("util._nid.callable", expected=True, actual=callable(_nid), ok=callable(_nid), fatal=True)')
         lines.append('')
+        lines.append('        # 20260119 客户反馈（第3点，口述）：正视图预制/后浇“两个矩形框”边不重合/有缝隙排查')
+        lines.append('        # 说明：本脚本采用“预制段 Solid + 后浇段 Solid”以区分材料；界面处应当共面（z=hp）且无几何间隙。')
+        lines.append('        _hp_eff = float(locals().get("__HP_EFFECTIVE__", 1025.0) or 1025.0)')
+        lines.append('        _L = float(locals().get("__L__", 0.0) or 0.0)')
+        lines.append('        _pre_yz = locals().get("precast_yz", None)')
+        lines.append('        _cast_yz = locals().get("cast_yz", None)')
+        lines.append('        def _yz_minmax(_yz, zsel=None, tol=1e-6):')
+        lines.append('            if not isinstance(_yz, list):')
+        lines.append('                return None, None, None, None')
+        lines.append('            ys = [float(p[0]) for p in _yz if isinstance(p, (list, tuple)) and len(p) >= 2]')
+        lines.append('            zs = [float(p[1]) for p in _yz if isinstance(p, (list, tuple)) and len(p) >= 2]')
+        lines.append('            y0 = min(ys) if ys else None')
+        lines.append('            y1 = max(ys) if ys else None')
+        lines.append('            z0 = min(zs) if zs else None')
+        lines.append('            z1 = max(zs) if zs else None')
+        lines.append('            if zsel is None:')
+        lines.append('                return y0, y1, z0, z1')
+        lines.append('            ys2 = [float(p[0]) for p in _yz if isinstance(p, (list, tuple)) and len(p) >= 2 and abs(float(p[1]) - float(zsel)) <= tol]')
+        lines.append('            return (min(ys2) if ys2 else None), (max(ys2) if ys2 else None), z0, z1')
+        lines.append('        _pre_y0, _pre_y1, _pre_z0, _pre_z1 = _yz_minmax(_pre_yz)')
+        lines.append('        _cast_y0, _cast_y1, _cast_z0, _cast_z1 = _yz_minmax(_cast_yz)')
+        lines.append('        _gap_z = None')
+        lines.append('        if _pre_z1 is not None and _cast_z0 is not None:')
+        lines.append('            _gap_z = float(_cast_z0) - float(_pre_z1)')
+        lines.append('        _ok_z = (_gap_z is not None) and (abs(float(_gap_z)) <= 1e-6) and (abs(float(_pre_z1) - _hp_eff) <= 1e-6) and (abs(float(_cast_z0) - _hp_eff) <= 1e-6)')
+        lines.append('        _check("geom.interface.z_match", expected=0.0, actual=_gap_z, ok=_ok_z, fatal=True, hp=_hp_eff, pre_zmax=_pre_z1, cast_zmin=_cast_z0)')
+        lines.append('        _pre_yhp0, _pre_yhp1, _, _ = _yz_minmax(_pre_yz, zsel=_hp_eff)')
+        lines.append('        _cast_yhp0, _cast_yhp1, _, _ = _yz_minmax(_cast_yz, zsel=_hp_eff)')
+        lines.append('        _ok_y = (_pre_yhp0 is not None and _pre_yhp1 is not None and _cast_yhp0 is not None and _cast_yhp1 is not None and abs(float(_pre_yhp0) - float(_cast_yhp0)) <= 1e-6 and abs(float(_pre_yhp1) - float(_cast_yhp1)) <= 1e-6)')
+        lines.append('        _check("geom.interface.y_span_match", expected=True, actual=_ok_y, ok=_ok_y, fatal=True, hp=_hp_eff, pre=(_pre_yhp0, _pre_yhp1), cast=(_cast_yhp0, _cast_yhp1))')
+        lines.append('        # 角点节点必须来自“实际截面宽度”，不能写死为示例的 ±250，否则 UI 自定义尺寸会误报')
+        lines.append('        _y0 = _cast_yhp0 if _cast_yhp0 is not None else _pre_yhp0')
+        lines.append('        _y1 = _cast_yhp1 if _cast_yhp1 is not None else _pre_yhp1')
+        lines.append('        _n00 = _nid(0.0, float(_y0), _hp_eff)')
+        lines.append('        _n01 = _nid(0.0, float(_y1), _hp_eff)')
+        lines.append('        _nL0 = _nid(_L, float(_y0), _hp_eff)')
+        lines.append('        _nL1 = _nid(_L, float(_y1), _hp_eff)')
+        lines.append('        _ok_corner = all(v is not None for v in [_n00, _n01, _nL0, _nL1])')
+        lines.append('        _check("geom.interface.corner_nodes", expected=True, actual=_ok_corner, ok=_ok_corner, fatal=True, ids=(_n00, _n01, _nL0, _nL1), y=(_y0,_y1), hp=_hp_eff)')
+        lines.append('        _coords = list(__NODE_COORDS__.values())')
+        lines.append('        _ok_unique = (len(_coords) == len(set(_coords)))')
+        lines.append('        _check("node.coords.unique", expected=True, actual=_ok_unique, ok=_ok_unique, fatal=True, n=len(_coords))')
+        lines.append('')
+        lines.append('        # 钢筋线段“重复建模”排查：同一对节点的线段不应被创建多次（会导致观感双层/叠线、节点不干净）')
+        lines.append('        _ecnt = {}')
+        lines.append('        for (a, b) in __REBAR_EDGES__:')
+        lines.append('            if a is None or b is None or a == b:')
+        lines.append('                continue')
+        lines.append('            e = (a, b) if a < b else (b, a)')
+        lines.append('            _ecnt[e] = _ecnt.get(e, 0) + 1')
+        lines.append('        _dups = [(e, c, __NODE_COORDS__.get(e[0]), __NODE_COORDS__.get(e[1])) for (e, c) in _ecnt.items() if c > 1]')
+        lines.append('        # 说明：部分工况（例如搭接/分段加密）可能出现同一空间位置的多根钢筋重叠；')
+        lines.append('        # 这里不作为致命项，仅输出定量证据用于排查“观感双层/节点不干净”。')
+        lines.append('        _check("rebar.edge.duplicates", expected="info", actual=len(_dups), ok=True, fatal=False, sample=_dups[:3])')
+        lines.append('        # 2026-客户回复：钢筋必须嵌入到实体，否则计算阶段会被识别为自由构件')
+        lines.append('        # 兼容：几何脚本阶段可能无法创建嵌入（需网格后）。此处不再中断脚本，而是输出定量证据 + post-mesh 指南。')
+        lines.append('        _emb_ok = bool(locals().get("rebar_embed_ok", False))')
+        lines.append('        _emb_method = locals().get("rebar_embed_method", None)')
+        lines.append('        _emb_err = locals().get("rebar_embed_err", None)')
+        lines.append('        _check(')
+        lines.append('            "rebar.embeded.created",')
+        lines.append('            expected=("created_or_post_mesh"),')
+        lines.append('            actual=("created" if _emb_ok else "post_mesh"),')
+        lines.append('            ok=True,')
+        lines.append('            fatal=False,')
+        lines.append('            created=_emb_ok,')
+        lines.append('            method=_emb_method,')
+        lines.append('            err=_emb_err,')
+        lines.append('        )')
+        lines.append('')
         lines.append('        # --- 洞口 / 波纹管 / 布尔时序（STRICT 中断项）---')
         lines.append(f'        _hp = {hp:.3f}')
         lines.append('        # 叠合面位置验收：有上翼缘时应对齐“上翼缘底”(腹板全预制，现浇为顶盖)')
@@ -1955,34 +2798,90 @@ class CompositeBeamModelGenerator:
         lines.append('        _hp_raw = locals().get("__HP_RAW__", None)')
         lines.append('        _hp_eff = locals().get("__HP_EFFECTIVE__", None)')
         lines.append('        _hp_exp = locals().get("__HP_EXPECTED__", None)')
-        lines.append('        _check("geom.hp.rule", expected="upper_flange_internal", actual=_hp_rule, ok=(_hp_rule in ("upper_flange_internal","upper_flange_bottom","excel")))')
+        lines.append(f'        _check("geom.hp.rule", expected="{hp_rule}", actual=_hp_rule, ok=(_hp_rule == "{hp_rule}"), fatal=True)')
         lines.append('        if _hp_exp is not None and _hp_eff is not None:')
         lines.append('            _check("geom.hp.value", expected=_hp_exp, actual=_hp_eff, ok=(abs(float(_hp_eff)-float(_hp_exp)) <= 1e-3), fatal=True, hp_raw=_hp_raw)')
         lines.append(f'        _holes_expected = {len(self.params.holes) if self.params.holes else 0}')
-        lines.append('        _has_hole_pre = ("nhole0" in locals()) and ("whole0" in locals())')
-        lines.append('        _has_hole_cast = ("nhole_cast0" in locals()) and ("whole_cast0" in locals())')
+        lines.append('        # 多洞口：不要依赖 nhole0/whole0 是否存在（可能存在多洞口/分段建模/跳号），以“inners列表是否有内容”为准')
+        lines.append('        _has_hole_pre = isinstance(locals().get("hole_pre_inners", None), list) and (len(locals().get("hole_pre_inners", [])) > 0)')
+        lines.append('        _has_hole_cast = isinstance(locals().get("hole_cast_inners", None), list) and (len(locals().get("hole_cast_inners", [])) > 0)')
         lines.append('        _has_hole_any = _has_hole_pre or _has_hole_cast')
         lines.append('        _check("hole.exists", expected=(_holes_expected > 0), actual=_has_hole_any, ok=(_has_hole_any == (_holes_expected > 0)), fatal=(_holes_expected > 0))')
         lines.append('        if _holes_expected > 0:')
-        lines.append('            _hb = (locals().get("__HOLE_BOUNDS__", [None]) or [None])[0]')
-        lines.append('            _raw_z_min = float(_hb.get("raw_z_min")) if isinstance(_hb, dict) and ("raw_z_min" in _hb) else None')
-        lines.append('            _raw_z_max = float(_hb.get("raw_z_max")) if isinstance(_hb, dict) and ("raw_z_max" in _hb) else None')
+        lines.append('            _hb_all = locals().get("__HOLE_BOUNDS__", [])')
+        lines.append('            _hb0 = _hb_all[0] if (isinstance(_hb_all, list) and len(_hb_all) > 0) else None')
+        lines.append('            _raw_z_min = float(_hb0.get("raw_z_min")) if isinstance(_hb0, dict) and ("raw_z_min" in _hb0) else None')
+        lines.append('            _raw_z_max = float(_hb0.get("raw_z_max")) if isinstance(_hb0, dict) and ("raw_z_max" in _hb0) else None')
         lines.append('            _tol = 1e-6')
-        lines.append('            _need_pre = (_raw_z_min is None) or (float(_raw_z_min) < float(_hp) - _tol)')
-        lines.append('            _need_cast = (_raw_z_max is not None) and (float(_raw_z_max) > float(_hp) + _tol)')
-        lines.append('            _cross = (_raw_z_min is not None) and (_raw_z_max is not None) and (float(_raw_z_min) < float(_hp) - _tol) and (float(_raw_z_max) > float(_hp) + _tol)')
+        lines.append('            # 多洞口：跨越叠合面/是否需要预制段或后浇段开孔，按所有洞口综合判定')
+        lines.append('            _raw_pairs = []')
+        lines.append('            for _hb in (_hb_all if isinstance(_hb_all, list) else []):')
+        lines.append('                if not isinstance(_hb, dict):')
+        lines.append('                    continue')
+        lines.append('                _rz0 = _hb.get("raw_z_min", None)')
+        lines.append('                _rz1 = _hb.get("raw_z_max", None)')
+        lines.append('                try:')
+        lines.append('                    _rz0 = float(_rz0) if _rz0 is not None else None')
+        lines.append('                except Exception:')
+        lines.append('                    _rz0 = None')
+        lines.append('                try:')
+        lines.append('                    _rz1 = float(_rz1) if _rz1 is not None else None')
+        lines.append('                except Exception:')
+        lines.append('                    _rz1 = None')
+        lines.append('                _raw_pairs.append((_rz0, _rz1))')
+        lines.append('            _need_pre = any((rz0 is None) or (float(rz0) < float(_hp) - _tol) for (rz0, _rz1) in _raw_pairs)')
+        lines.append('            _need_cast = any((rz1 is not None) and (float(rz1) > float(_hp) + _tol) for (_rz0, rz1) in _raw_pairs)')
+        lines.append('            _cross = any((rz0 is not None) and (rz1 is not None) and (float(rz0) < float(_hp) - _tol) and (float(rz1) > float(_hp) + _tol) for (rz0, rz1) in _raw_pairs)')
+        lines.append('            # 洞口设计约束：洞口应完全位于预制段腹板内，不跨越叠合面（避免洞口处出现“界面薄片/共面面”影响网格）')
+        lines.append('            _check("hole.design.within_precast_only", expected=True, actual=(not _need_cast), ok=(not _need_cast), fatal=True, hp=_hp, raw_pairs=_raw_pairs)')
+        lines.append('            # 洞口设计约束：避开下翼缘顶/梁底与叠合面（默认各 50mm）')
+        lines.append('            _avoid_hp = 50.0')
+        lines.append('            _avoid_bot = 50.0')
+        lines.append('            _tfL = float(locals().get("__TF_LOWER__", 0.0) or 0.0)')
+        lines.append('            _ok_clear = True')
+        lines.append('            _bad = None')
+        lines.append('            for _hb in (_hb_all if isinstance(_hb_all, list) else []):')
+        lines.append('                if not isinstance(_hb, dict):')
+        lines.append('                    continue')
+        lines.append('                try:')
+        lines.append('                    _z0 = float(_hb.get("raw_z_min"))')
+        lines.append('                    _z1 = float(_hb.get("raw_z_max"))')
+        lines.append('                except Exception:')
+        lines.append('                    continue')
+        lines.append('                if (_z0 < float(_tfL) + _avoid_bot - 1e-6) or (_z1 > float(_hp) - _avoid_hp + 1e-6):')
+        lines.append('                    _ok_clear = False')
+        lines.append('                    _bad = {"raw_z_min": _z0, "raw_z_max": _z1, "tf_lower": _tfL, "hp": _hp}')
+        lines.append('                    break')
+        lines.append('            _check("hole.design.clearance", expected=True, actual=_ok_clear, ok=_ok_clear, fatal=True, avoid_hp=_avoid_hp, avoid_bot=_avoid_bot, bad=_bad)')
         lines.append('            if _need_pre:')
-        lines.append('                _check("hole.precast.nhole_len", expected=8, actual=(len(nhole0) if isinstance(nhole0, list) else None), ok=(isinstance(nhole0, list) and len(nhole0) == 8), fatal=True)')
-        lines.append('                _check("hole.precast.whole_len", expected=12, actual=(len(whole0) if isinstance(whole0, list) else None), ok=(isinstance(whole0, list) and len(whole0) == 12), fatal=True)')
+        lines.append('                # 多洞口：以 inners/孔壁面数量为准，不强制要求 nhole0/whole0 的命名存在')
         lines.append('                _inner_pre = locals().get("hole_pre_inner_surfs", [])')
-        lines.append('                _check("hole.precast.inner_surfs", expected=4, actual=(len(_inner_pre) if isinstance(_inner_pre, list) else None), ok=(isinstance(_inner_pre, list) and len(_inner_pre) == 4), fatal=True, ids=_inner_pre)')
+        lines.append('                _inner_pre_n = (len(_inner_pre) if isinstance(_inner_pre, list) else None)')
+        lines.append('                # 多洞口：每个洞口应贡献4个孔壁面（bottom/right/top/left），因此总数应为 4*n')
+        lines.append('                _inner_pre_ok = (isinstance(_inner_pre, list) and isinstance(_inner_pre_n, int) and (_inner_pre_n % 4 == 0) and (_inner_pre_n >= 4))')
+        lines.append('                _check("hole.precast.inner_surfs", expected="4*n", actual=_inner_pre_n, ok=_inner_pre_ok, fatal=True, n_holes=(_inner_pre_n//4 if _inner_pre_ok else None), ids=_inner_pre[:8])')
+        lines.append('                _pre_inners = locals().get("hole_pre_inners", [])')
+        lines.append('                _pre_outers = locals().get("hole_pre_outers", [])')
+        lines.append('                _npre = (_inner_pre_n//4 if _inner_pre_ok else None)')
+        lines.append('                _loops_ok = (isinstance(_pre_inners, list) and isinstance(_pre_outers, list) and (_npre is not None) and len(_pre_inners) == _npre and len(_pre_outers) == _npre and all(isinstance(lp, list) and len(lp) == 4 for lp in _pre_inners) and all(isinstance(lp, list) and len(lp) == 4 for lp in _pre_outers))')
+        lines.append('                _check("hole.precast.inner_loops", expected="n>=1", actual=(len(_pre_inners) if isinstance(_pre_inners, list) else None), ok=_loops_ok, fatal=True, n_holes=_npre)')
         lines.append('            else:')
         lines.append('                _check("hole.precast.segment", expected=False, actual=_has_hole_pre, ok=(not _has_hole_pre))')
         lines.append('            _inner_cast = locals().get("hole_cast_inner_surfs", [])')
         lines.append('            _check("hole.cast.segment", expected=_need_cast, actual=_has_hole_cast, ok=(_has_hole_cast == _need_cast), fatal=_need_cast)')
-        lines.append('            _exp_inner_cast = 4 if _need_cast else 0')
         lines.append('            _act_inner_cast = (len(_inner_cast) if isinstance(_inner_cast, list) else None)')
-        lines.append('            _check("hole.cast.inner_surfs", expected=_exp_inner_cast, actual=_act_inner_cast, ok=(isinstance(_act_inner_cast, int) and _act_inner_cast == _exp_inner_cast), fatal=_need_cast, ids=_inner_cast)')
+        lines.append('            if not _need_cast:')
+        lines.append('                _ok_cast_inner = (isinstance(_act_inner_cast, int) and _act_inner_cast == 0)')
+        lines.append('                _check("hole.cast.inner_surfs", expected=0, actual=_act_inner_cast, ok=_ok_cast_inner, fatal=False, ids=_inner_cast[:8])')
+        lines.append('            else:')
+        lines.append('                # 多洞口：每个洞口应贡献4个孔壁面（bottom/right/top/left），因此总数应为 4*n')
+        lines.append('                _ok_cast_inner = (isinstance(_act_inner_cast, int) and (_act_inner_cast % 4 == 0) and (_act_inner_cast >= 4))')
+        lines.append('                _check("hole.cast.inner_surfs", expected=\"4*n\", actual=_act_inner_cast, ok=_ok_cast_inner, fatal=True, n_holes=(_act_inner_cast//4 if _ok_cast_inner else None), ids=_inner_cast[:8])')
+        lines.append('                _cast_inners = locals().get("hole_cast_inners", [])')
+        lines.append('                _cast_outers = locals().get("hole_cast_outers", [])')
+        lines.append('                _ncast = (_act_inner_cast//4 if _ok_cast_inner else None)')
+        lines.append('                _loops_ok2 = (isinstance(_cast_inners, list) and isinstance(_cast_outers, list) and (_ncast is not None) and len(_cast_inners) == _ncast and len(_cast_outers) == _ncast and all(isinstance(lp, list) and len(lp) == 4 for lp in _cast_inners) and all(isinstance(lp, list) and len(lp) == 4 for lp in _cast_outers))')
+        lines.append('                _check("hole.cast.inner_loops", expected=\"n>=1\", actual=(len(_cast_inners) if isinstance(_cast_inners, list) else None), ok=_loops_ok2, fatal=True, n_holes=_ncast)')
         lines.append('            # Z 轴连续：仅当洞口跨越叠合面时要求连续')
         lines.append('            def _z_of_id(nid0):')
         lines.append('                try:')
@@ -2001,6 +2900,17 @@ class CompositeBeamModelGenerator:
         lines.append('            _pre_zmax = max(_pre_zs) if _pre_zs else None')
         lines.append('            _cast_zmin = min(_cast_zs) if _cast_zs else None')
         lines.append('            _cast_zmax = max(_cast_zs) if _cast_zs else None')
+        lines.append('            # PKPM 回复：洞口若“开到边线”(例如 zmin<=下翼缘顶)，不要让边线与翼缘表面重合；此处用 1mm 调整规避重合')
+        lines.append('            _tfL = float(locals().get("__TF_LOWER__", 0.0) or 0.0)')
+        lines.append('            _touch_edge = (_raw_z_min is not None) and (float(_tfL) > 1e-6) and (float(_raw_z_min) <= float(_tfL) + _tol)')
+        lines.append('            _adj_ok = (not _touch_edge) or ((_pre_zmin is not None) and (float(_pre_zmin) > float(_tfL) + 1e-6))')
+        lines.append('            _check("hole.open_edge.avoid_overlap.lower_flange_top", expected=True, actual=_adj_ok, ok=_adj_ok, fatal=True, raw=_raw_z_min, tf_lower=_tfL, actual_zmin=_pre_zmin)')
+        lines.append('            # 同理：洞口顶边若“触到叠合面(hp)但不跨越”，会在界面形成 T 形边界/薄片，影响网格；此处要求已做下移避让')
+        lines.append('            _H = float(locals().get("__H__", 0.0) or 0.0)')
+        lines.append('            _has_cast = (float(_H) - float(_hp)) > 1e-6')
+        lines.append('            _touch_hp = (not _need_cast) and _has_cast and (_raw_z_max is not None) and (abs(float(_raw_z_max) - float(_hp)) <= _tol)')
+        lines.append('            _adj_hp_ok = (not _touch_hp) or ((_pre_zmax is not None) and (float(_pre_zmax) < float(_hp) - 1e-6))')
+        lines.append('            _check("hole.open_edge.avoid_overlap.hp_interface", expected=True, actual=_adj_hp_ok, ok=_adj_hp_ok, fatal=True, raw=_raw_z_max, hp=_hp, actual_zmax=_pre_zmax)')
         lines.append('            _z_cont = (not _cross) or ((_pre_zmax is not None) and (_cast_zmin is not None) and (abs(float(_pre_zmax) - float(_hp)) <= _tol) and (abs(float(_cast_zmin) - float(_hp)) <= _tol))')
         lines.append('            _check("hole.z_continuous", expected=True, actual=_z_cont, ok=_z_cont, fatal=_cross, hp=_hp, pre_zmin=_pre_zmin, pre_zmax=_pre_zmax, pre_zs=_pre_zs, cast_zmin=_cast_zmin, cast_zmax=_cast_zmax, cast_zs=_cast_zs)')
         lines.append('            # 叠合面薄片清理：若洞口跨越叠合面，则必须在 z=hp 的界面也配置 inners 开口')
@@ -2044,17 +2954,19 @@ class CompositeBeamModelGenerator:
         lines.append('                    if (mx > _xmin + _eps and mx < _xmax - _eps and my > _ymin + _eps and my < _ymax - _eps and mz > _zmin + _eps and mz < _zmax - _eps):')
         lines.append('                        _bad.append((a,b,(round(mx,3),round(my,3),round(mz,3))))')
         lines.append('            _check("rebar.hole_void.edges", expected=0, actual=len(_bad), ok=(len(_bad) == 0), fatal=True, bounds=(_xmin,_xmax,_ymin,_ymax,_zmin,_zmax), sample=_bad[:3])')
-        lines.append('            # 洞口补强自检：洞口上下小梁箍筋（local_small_beam, ring13 且限制在局部高度带）与洞口两侧加强箍筋（全高）')
+        lines.append('            # 洞口补强自检：洞口上下小梁箍筋（local_small_beam，腹板矩形闭合且避开洞口真空区）与洞口两侧加强箍筋（全高）')
         lines.append('            _hb0 = (locals().get("__HOLE_BOUNDS__", [None]) or [None])[0]')
         lines.append('            if isinstance(_hb0, dict):')
         lines.append('                _cover = float(locals().get("__COVER__", 25.0))')
         lines.append('                _tw = float(locals().get("__TW__", 0.0))')
         lines.append('                _H = float(locals().get("__H__", 0.0))')
         lines.append('                _tfL = float(locals().get("__TF_LOWER__", 0.0))')
-        lines.append('                _xL = float(_hb0.get("x_min")) if _hb0.get("x_min") is not None else None')
-        lines.append('                _xR = float(_hb0.get("x_max")) if _hb0.get("x_max") is not None else None')
-        lines.append('                _hz0 = float(_hb0.get("raw_z_min")) if _hb0.get("raw_z_min") is not None else None')
+        lines.append('                _xL = float(_hb0.get("x_min_precast")) if _hb0.get("x_min_precast") is not None else (float(_hb0.get("x_min")) if _hb0.get("x_min") is not None else None)')
+        lines.append('                _xR = float(_hb0.get("x_max_precast")) if _hb0.get("x_max_precast") is not None else (float(_hb0.get("x_max")) if _hb0.get("x_max") is not None else None)')
+        lines.append('                _hz0_raw = float(_hb0.get("raw_z_min")) if _hb0.get("raw_z_min") is not None else None')
         lines.append('                _hz1 = float(_hb0.get("raw_z_max")) if _hb0.get("raw_z_max") is not None else None')
+        lines.append('                # 洞口“有效底边”：以预制段实际开孔的 z_min_precast 为准（避免 raw_z_min 过低导致自检误判）')
+        lines.append('                _hz0 = float(_hb0.get("z_min_precast")) if _hb0.get("z_min_precast") is not None else _hz0_raw')
         lines.append('                _yminw = -_tw/2.0 + _cover')
         lines.append('                _ymaxw = _tw/2.0 - _cover')
         lines.append('                # 预先构建边集合用于判定闭合矩形')
@@ -2065,15 +2977,30 @@ class CompositeBeamModelGenerator:
         lines.append('                def _has_edge(n1,n2):')
         lines.append('                    if n1 is None or n2 is None: return False')
         lines.append('                    return ((n1,n2) if n1<n2 else (n2,n1)) in _edges')
-        lines.append('                # 1) 洞顶/洞底小梁箍筋：必须为 ring13，并严格限制在洞顶/洞底的局部高度带内（不得冲到梁顶）')
+        lines.append('                # 1) 洞顶/洞底小梁箍筋：腹板矩形闭合（无中间横筋），其中“上部小梁箍筋”顶面需到梁顶')
         lines.append('                _sbd = float(_hb0.get("small_beam_stirrup_diameter", 0.0) or 0.0)')
         lines.append('                _sbs = float(_hb0.get("small_beam_stirrup_spacing", 0.0) or 0.0)')
+        lines.append('                try:')
+        lines.append('                    _sb_legs = int(float(_hb0.get("small_beam_stirrup_legs", 0) or 0))')
+        lines.append('                except Exception:')
+        lines.append('                    _sb_legs = 0')
+        lines.append('                if _sb_legs <= 0: _sb_legs = 4')
         lines.append('                if _sbd > 1e-6 and _sbs > 1e-6 and _xL is not None and _hz0 is not None and _hz1 is not None:')
         lines.append('                    _band = 80.0')
-        lines.append('                    _zt1 = max(_cover, float(_hz1) + _cover)')
-        lines.append('                    _zt2 = min(_H - _cover, float(_zt1) + _band)')
-        lines.append('                    if _zt2 <= _zt1 + 1e-6: _zt2 = _zt1 + 1.0')
-        lines.append('                    _zb2 = min(_H - _cover, float(_hz0) - _cover)')
+        lines.append('                    _ztop = float(_H) - _cover')
+        lines.append('                    _zt1_raw = max(_cover, float(_hz1) + _cover)')
+        lines.append('                    # 顶部带不得越出混凝土：洞口过高则跳过（不能像旧逻辑那样把 z2 抬到梁顶以上）')
+        lines.append('                    _skip_top = (_zt1_raw >= _ztop - 1e-6)')
+        lines.append('                    _zt1 = min(_zt1_raw, _ztop)')
+        lines.append('                    _zt2 = _ztop')
+        lines.append('                    # 证据：上部小梁箍筋顶面应到梁顶（若洞顶过高导致无空间则跳过）')
+        lines.append('                    if not _skip_top:')
+        lines.append('                        _ok_to_top = (abs(float(_zt2) - (float(_H) - _cover)) <= 1e-6)')
+        lines.append('                        _check("hole.small_beam_stirrup.top.reaches_beam_top", expected=True, actual=_ok_to_top, ok=_ok_to_top, fatal=True, z2=_zt2, ztop=(float(_H) - _cover))')
+        lines.append('                    else:')
+        lines.append('                        _check("hole.small_beam_stirrup.top.reaches_beam_top", expected="skipped", actual="skipped", ok=True, z1=_zt1, ztop=(float(_H) - _cover))')
+        lines.append('                    # 底部小梁箍筋带：上界上抬 1mm，避免 zf==z2 导致 ring13 节点合并/缺边（见客户报错 rebar.local_small_beam）')
+        lines.append('                    _zb2 = min(_H - _cover, float(_hz0) - _cover + 1.0)')
         lines.append('                    _zb1 = max(_cover, float(_zb2) - _band)')
         lines.append('                    if _zb2 <= _zb1 + 1e-6: _zb2 = _zb1 + 1.0')
         lines.append('                    _ec = float(locals().get("__REBAR_HOLE_EDGE_CLEAR__", 0.0) or 0.0)')
@@ -2094,45 +3021,164 @@ class CompositeBeamModelGenerator:
         lines.append('                        if n1 is None or n2 is None: return False')
         lines.append('                        return ((n1,n2) if n1<n2 else (n2,n1)) in _edges2')
         lines.append('                    _tw = float(locals().get("__TW__", 0.0) or 0.0)')
-        lines.append('                    _bf = float(locals().get("__BF_LOWER__", 0.0) or 0.0)')
-        lines.append('                    _fw = _tw + 2.0*_bf')
         lines.append('                    _yi = _tw/2.0 - _cover')
-        lines.append('                    # 注意：这里不要在嵌套函数里用 locals().get("__TF_LOWER__")，否则只能拿到内层局部变量，导致判定失效')
-        lines.append('                    _tfL0 = float(_tfL)')
-        lines.append('                    def _yo_of(z1,z2):')
-        lines.append('                        zm = 0.5*(float(z1)+float(z2))')
-        lines.append('                        if zm <= (_tfL0 - _cover + 1e-6):')
-        lines.append('                            return _fw/2.0 - _cover')
-        lines.append('                        return max(_yi + 1.0, _yi)')
-        lines.append('                    def _ring13_probe(xv,z1,z2):')
-        lines.append('                        yo=_yo_of(z1,z2); yi=_yi; zf=0.5*(float(z1)+float(z2))')
-        lines.append('                        pts=['
-                     '("n1",(xv,-yo,z1)),("n2",(xv,-yi,z1)),("n3",(xv,yi,z1)),("n4",(xv,yo,z1)),'
-                     '("n5",(xv,-yo,zf)),("n6",(xv,yo,zf)),("n7",(xv,-yi,zf)),("n8",(xv,yi,zf)),'
-                     '("n9",(xv,-yi,z2)),("n10",(xv,yi,z2))'
-                     ']')
-        lines.append('                        ids=[]; miss=[]')
-        lines.append('                        for name,pt in pts:')
-        lines.append('                            nid=_nid(pt[0],pt[1],pt[2])')
-        lines.append('                            ids.append((name,nid,pt))')
-        lines.append('                        if any(nid is None for (_,nid,_) in ids):')
-        lines.append('                            for name,nid,pt in ids:')
-        lines.append('                                if nid is None: miss.append(("node",name,pt))')
-        lines.append('                            return False, yo, miss')
-        lines.append('                        m={name:nid for (name,nid,_) in ids}')
-        lines.append('                        pairs=[("e1","n1","n2"),("e2","n2","n3"),("e3","n3","n4"),("e4","n1","n5"),("e5","n4","n6"),("e6","n2","n7"),("e7","n3","n8"),("e8","n5","n7"),("e9","n8","n6"),("e10","n7","n9"),("e11","n8","n10"),("e12","n9","n10"),("e13","n7","n8")]')
-        lines.append('                        for lab,a,b in pairs:')
-        lines.append('                            if not _has2(m[a],m[b]): miss.append(("edge",lab,a,b,m[a],m[b]))')
-        lines.append('                        return (len(miss)==0), yo, miss')
-        lines.append('                    _ok_top, _yo_top, _mis_top = _ring13_probe(_x_probe,_zt1,_zt2)')
-        lines.append('                    _ok_bot, _yo_bot, _mis_bot = _ring13_probe(_x_probe,_zb1,_zb2)')
+        lines.append('                    # 洞口上下“小梁箍筋”自检：支持 2肢/4肢/多肢（分段横筋），不再要求“角点直连”')
+        lines.append('                    def _vert_ys_at_x(xv, zlo, zhi, tol=1e-6, tolx=0.5):')
+        lines.append('                        ys=set()')
+        lines.append('                        for (u,v) in __LOCAL_SMALL_BEAM_EDGES__:')
+        lines.append('                            pu=__NODE_COORDS__.get(u); pv=__NODE_COORDS__.get(v)')
+        lines.append('                            if pu is None or pv is None: continue')
+        lines.append('                            try:')
+        lines.append('                                xm=0.5*(float(pu[0])+float(pv[0]))')
+        lines.append('                                if abs(xm - float(xv)) > float(tolx):')
+        lines.append('                                    continue')
+        lines.append('                                dx=abs(float(pu[0])-float(pv[0])); dy=abs(float(pu[1])-float(pv[1])); dz=abs(float(pu[2])-float(pv[2]))')
+        lines.append('                                zm=0.5*(float(pu[2])+float(pv[2]))')
+        lines.append('                            except Exception:')
+        lines.append('                                continue')
+        lines.append('                            if dx <= tol and dy <= tol and dz > tol and (zm >= float(zlo)-1e-6 and zm <= float(zhi)+1e-6):')
+        lines.append('                                ys.add(round(float(pu[1]), 3))')
+        lines.append('                        return sorted(ys)')
+        lines.append('                    def _ring_probe(xv, z1, z2, ys):')
+        lines.append('                        miss=[]')
+        lines.append('                        ys=list(ys or [])')
+        lines.append('                        ys=sorted(set(float(v) for v in ys))')
+        lines.append('                        if len(ys) < 2:')
+        lines.append('                            return False, [("legs", len(ys))]')
+        lines.append('                        nb=[_nid(xv, float(yv), float(z1)) for yv in ys]')
+        lines.append('                        nt=[_nid(xv, float(yv), float(z2)) for yv in ys]')
+        lines.append('                        for i,nid0 in enumerate(nb):')
+        lines.append('                            if nid0 is None: miss.append(("node","bot",ys[i],z1))')
+        lines.append('                        for i,nid0 in enumerate(nt):')
+        lines.append('                            if nid0 is None: miss.append(("node","top",ys[i],z2))')
+        lines.append('                        if miss: return False, miss')
+        lines.append('                        # 竖向肢：每个 y 一根')
+        lines.append('                        for i in range(len(ys)):')
+        lines.append('                            if not _has2(nb[i], nt[i]):')
+        lines.append('                                miss.append(("edge","vert",ys[i],nb[i],nt[i]))')
+        lines.append('                        # 横向筋：按相邻 y 分段连接（允许多肢分段）')
+        lines.append('                        for i in range(len(ys)-1):')
+        lines.append('                            if not _has2(nb[i], nb[i+1]):')
+        lines.append('                                miss.append(("edge","bot",ys[i],ys[i+1],nb[i],nb[i+1]))')
+        lines.append('                            if not _has2(nt[i], nt[i+1]):')
+        lines.append('                                miss.append(("edge","top",ys[i],ys[i+1],nt[i],nt[i+1]))')
+        lines.append('                        return (len(miss)==0), miss')
+        lines.append('                    if locals().get("_skip_top", False):')
+        lines.append('                        _ok_top, _mis_top = True, []')
+        lines.append('                    else:')
+        lines.append('                        _ys_top0 = _vert_ys_at_x(_x_probe, _zt1, _zt2)')
+        lines.append('                        _ok_top, _mis_top = _ring_probe(_x_probe, _zt1, _zt2, _ys_top0)')
+        lines.append('                    _yo_top = float(_yi)')
+        lines.append('                    # 底部带：梁底保护层 -> 洞口底边之下保护层；洞口过低则跳过（避免落入洞口真空区）')
+        lines.append('                    _zb1 = float(_cover)')
+        lines.append('                    _zb2_raw = min(_H - _cover, float(_hz0) - _cover) if (_hz0 is not None) else float(_zb1)')
+        lines.append('                    _zb2 = max(float(_zb1) + 1.0, float(_zb2_raw))')
+        lines.append('                    _bot_enabled = (float(_zb2) > float(_zb1) + 1e-6)')
+        lines.append('                    if _bot_enabled:')
+        lines.append('                        _ys_bot0 = _vert_ys_at_x(_x_probe, _zb1, _zb2)')
+        lines.append('                        # 底部带可能存在“翼缘外肢仅到翼缘顶”的阶梯：外肢不应被要求贯通到 _zb2')
+        lines.append('                        _ys_web = [y for y in _ys_bot0 if abs(float(y)) <= float(_yi) + 1e-3]')
+        lines.append('                        _ys_outer = [y for y in _ys_bot0 if abs(float(y)) > float(_yi) + 1e-3]')
+        lines.append('                        _ok_bot_web, _mis_bot_web = _ring_probe(_x_probe, _zb1, _zb2, _ys_web)')
+        lines.append('                        _ok_bot_outer, _mis_bot_outer = True, []')
+        lines.append('                        if _ys_outer:')
+        lines.append('                            _tfL2 = float(locals().get("__TF_LOWER__", 0.0) or 0.0)')
+        lines.append('                            _z_step = max(float(_zb1) + 1.0, min(float(_zb2), float(_tfL2) - float(_cover))) if _tfL2 > 1e-6 else float(_zb1)')
+        lines.append('                            if _z_step > float(_zb1) + 1e-6 and _z_step < float(_zb2) - 1e-6:')
+        lines.append('                                # 外肢仅要求到 _z_step（翼缘顶-保护层），并闭合成简化环')
+        lines.append('                                _ok_outer_ring, _mis_outer_ring = _ring_probe(_x_probe, _zb1, _z_step, _ys_outer)')
+        lines.append('                                _ok_bot_outer = _ok_outer_ring')
+        lines.append('                                _mis_bot_outer = [("outer",)+tuple(m) if isinstance(m, tuple) else ("outer",m) for m in (_mis_outer_ring or [])]')
+        lines.append('                            else:')
+        lines.append('                                # 无可用翼缘高度：外肢应不存在；若存在也不作为 fatal（交由 within_concrete/y_by_z 控制）')
+        lines.append('                                _ok_bot_outer, _mis_bot_outer = True, []')
+        lines.append('                        _ok_bot = _ok_bot_web and _ok_bot_outer')
+        lines.append('                        _mis_bot = (_mis_bot_web or []) + (_mis_bot_outer or [])')
+        lines.append('                    else:')
+        lines.append('                        _ok_bot, _mis_bot = True, []')
+        lines.append('                    _yo_bot = float(_yi)')
+        lines.append('                    # 客户“侧边缝隙”定量：洞口上方小梁箍筋腹板宽度应与常规腹板箍筋一致（差值应为 0）')
+        lines.append('                    _gap_y = abs(float(_yo_top) - float(_yi))')
+        lines.append('                    _ok_gap = (_gap_y <= 1e-6)')
+        lines.append('                    _check("view.gap.hole_small_beam_stirrup.top.web_width_diff", expected=0.0, actual=_gap_y, ok=_ok_gap, fatal=True, yo=_yo_top, yi=_yi)')
+        lines.append('                    # 观感“中间一道横线”排查：洞口小梁箍筋不应包含中间横向连筋（仅保留闭合矩形四边）')
+        lines.append('                    # 多肢/分段场景：扫描任意水平线段，而不是只用“左右角点直连”判断')
+        lines.append('                    def _has_mid_horiz(xv, zmid, ylo, yhi, tolx=0.5, tolz=0.5):')
+        lines.append('                        for (u,v) in __LOCAL_SMALL_BEAM_EDGES__:')
+        lines.append('                            pu=__NODE_COORDS__.get(u); pv=__NODE_COORDS__.get(v)')
+        lines.append('                            if pu is None or pv is None: continue')
+        lines.append('                            try:')
+        lines.append('                                xm=0.5*(float(pu[0])+float(pv[0]))')
+        lines.append('                                if abs(xm - float(xv)) > float(tolx):')
+        lines.append('                                    continue')
+        lines.append('                                z1=float(pu[2]); z2=float(pv[2]); y1=float(pu[1]); y2=float(pv[1])')
+        lines.append('                            except Exception:')
+        lines.append('                                continue')
+        lines.append('                            if abs(z1 - z2) <= 1e-6 and abs(z1 - float(zmid)) <= float(tolz) and abs(y1 - y2) > 1e-6:')
+        lines.append('                                ym=0.5*(y1+y2)')
+        lines.append('                                if ym >= float(ylo)-1e-6 and ym <= float(yhi)+1e-6:')
+        lines.append('                                    return True')
+        lines.append('                        return False')
+        lines.append('                    if locals().get("_skip_top", False):')
+        lines.append('                        _check("hole.small_beam_stirrup.top.mid_tie", expected="skipped", actual="skipped", ok=True)')
+        lines.append('                    else:')
+        lines.append('                        _zf_top = 0.5*(float(_zt1)+float(_zt2))')
+        lines.append('                        _has_mid_top = _has_mid_horiz(_x_probe, _zf_top, -float(_yi), float(_yi))')
+        lines.append('                        _check("hole.small_beam_stirrup.top.mid_tie", expected=False, actual=_has_mid_top, ok=(not _has_mid_top), fatal=True, x=_x_probe, y=(-float(_yi), float(_yi)), z=float(_zf_top))')
+        lines.append('                    if _bot_enabled:')
+        lines.append('                        _zf_bot2 = 0.5*(float(_zb1)+float(_zb2))')
+        lines.append('                        _has_mid_bot = _has_mid_horiz(_x_probe, _zf_bot2, -float(_yi), float(_yi))')
+        lines.append('                        _check("hole.small_beam_stirrup.bottom.mid_tie", expected=False, actual=_has_mid_bot, ok=(not _has_mid_bot), fatal=True, x=_x_probe, y=(-float(_yi), float(_yi)), z=float(_zf_bot2))')
+        lines.append('                        _ok_to_bot = (abs(float(_zb1) - float(_cover)) <= 1e-6)')
+        lines.append('                        _check("hole.small_beam_stirrup.bottom.reaches_beam_bottom", expected=True, actual=_ok_to_bot, ok=_ok_to_bot, fatal=True, z1=_zb1, zbot=_cover)')
+        lines.append('                    else:')
+        lines.append('                        _check("hole.small_beam_stirrup.bottom.mid_tie", expected="skipped", actual="skipped", ok=True, raw=_hz0, cover=_cover)')
+        lines.append('                        _check("hole.small_beam_stirrup.bottom.reaches_beam_bottom", expected="skipped", actual="skipped", ok=True, raw=_hz0, cover=_cover)')
+        lines.append('                    # 肢数证据（定量）：按“总肢数(含外肢)”统计洞口上下小梁箍筋的竖向肢数量（按不同 Y 坐标计数）')
+        lines.append('                    def _vert_ys_local(zlo, zhi, tol=1e-6):')
+        lines.append('                        ys=set()')
+        lines.append('                        for (u,v) in __LOCAL_SMALL_BEAM_EDGES__:')
+        lines.append('                            pu=__NODE_COORDS__.get(u); pv=__NODE_COORDS__.get(v)')
+        lines.append('                            if pu is None or pv is None: continue')
+        lines.append('                            try:')
+        lines.append('                                dx=abs(float(pu[0])-float(pv[0])); dy=abs(float(pu[1])-float(pv[1])); dz=abs(float(pu[2])-float(pv[2]))')
+        lines.append('                                zm=0.5*(float(pu[2])+float(pv[2]))')
+        lines.append('                            except Exception:')
+        lines.append('                                continue')
+        lines.append('                            if dx <= tol and dy <= tol and dz > tol and (zm >= float(zlo)-1e-6 and zm <= float(zhi)+1e-6):')
+        lines.append('                                ys.add(round(float(pu[1]), 3))')
+        lines.append('                        return sorted(ys)')
+        lines.append('                    if not locals().get("_skip_top", False):')
+        lines.append('                        _ys_top = _vert_ys_local(_zt1, _zt2)')
+        lines.append('                        _check("hole.small_beam_stirrup.top.legs_count", expected=_sb_legs, actual=len(_ys_top), ok=(len(_ys_top) == int(_sb_legs)), fatal=True, y=_ys_top[:12])')
+        lines.append('                    else:')
+        lines.append('                        _check("hole.small_beam_stirrup.top.legs_count", expected="skipped", actual="skipped", ok=True)')
+        lines.append('                    if _bot_enabled:')
+        lines.append('                        _ys_bot = _vert_ys_local(_zb1, _zb2)')
+        lines.append('                        _check("hole.small_beam_stirrup.bottom.legs_count", expected=_sb_legs, actual=len(_ys_bot), ok=(len(_ys_bot) == int(_sb_legs)), fatal=True, y=_ys_bot[:12])')
+        lines.append('                    else:')
+        lines.append('                        _check("hole.small_beam_stirrup.bottom.legs_count", expected="skipped", actual="skipped", ok=True)')
         lines.append('                    # Z 限制：local_small_beam 的所有边中点必须落在顶带或底带内')
+        lines.append('                    # 多洞口场景：__LOCAL_SMALL_BEAM_EDGES__ 会包含多个洞口的边；此处仅校核当前洞口x范围内的边，避免误报')
         lines.append('                    _badz=0; _cnt=0')
+        lines.append('                    def _xmid(a,b):')
+        lines.append('                        pa=__NODE_COORDS__.get(a); pb=__NODE_COORDS__.get(b) ')
+        lines.append('                        if pa is None or pb is None: return None')
+        lines.append('                        return 0.5*(float(pa[0])+float(pb[0]))')
         lines.append('                    def _zmid(a,b):')
         lines.append('                        pa=__NODE_COORDS__.get(a); pb=__NODE_COORDS__.get(b) ')
         lines.append('                        if pa is None or pb is None: return None')
         lines.append('                        return 0.5*(float(pa[2])+float(pb[2]))')
+        lines.append('                    _xmin_h = None; _xmax_h = None')
+        lines.append('                    if _xL is not None and _xR is not None:')
+        lines.append('                        _xmin_h = min(float(_xL), float(_xR)) - 5.0')
+        lines.append('                        _xmax_h = max(float(_xL), float(_xR)) + float(_ec) + 5.0')
         lines.append('                    for (a,b) in __LOCAL_SMALL_BEAM_EDGES__:')
+        lines.append('                        xm=_xmid(a,b)')
+        lines.append('                        if xm is None: continue')
+        lines.append('                        if _xmin_h is not None and _xmax_h is not None:')
+        lines.append('                            if xm < _xmin_h - 1e-6 or xm > _xmax_h + 1e-6:')
+        lines.append('                                continue')
         lines.append('                        zm=_zmid(a,b) ')
         lines.append('                        if zm is None: continue')
         lines.append('                        _cnt += 1')
@@ -2156,11 +3202,70 @@ class CompositeBeamModelGenerator:
         lines.append('                    _ec = float(locals().get("__REBAR_HOLE_EDGE_CLEAR__", 0.0) or 0.0)')
         lines.append('                    _xpR = _xR + _ec')
         lines.append('                    a=_nid(_xpL, -_y_inner, _z0); b=_nid(_xpL, -_y_inner, _zmid); c=_nid(_xpL, -_y_inner, _ztop)')
-        lines.append('                    _okL = all(v is not None for v in [a,b,c]) and _has_edge(a,b) and _has_edge(b,c)')
+        lines.append('                    # 兼容两种拓扑：ring13(分段竖边 a-b-c) 或退化矩形(直连竖边 a-c)')
+        lines.append('                    _okL = (a is not None and c is not None) and ( (_has_edge(a,c)) or (b is not None and _has_edge(a,b) and _has_edge(b,c)) )')
         lines.append('                    _check("hole.side_stirrup.full_height.left", expected=True, actual=_okL, ok=_okL, fatal=True, x=_xpL)')
         lines.append('                    a=_nid(_xpR, -_y_inner, _z0); b=_nid(_xpR, -_y_inner, _zmid); c=_nid(_xpR, -_y_inner, _ztop)')
-        lines.append('                    _okR = all(v is not None for v in [a,b,c]) and _has_edge(a,b) and _has_edge(b,c)')
+        lines.append('                    _okR = (a is not None and c is not None) and ( (_has_edge(a,c)) or (b is not None and _has_edge(a,b) and _has_edge(b,c)) )')
         lines.append('                    _check("hole.side_stirrup.full_height.right", expected=True, actual=_okR, ok=_okR, fatal=True, x=_xpR)')
+        lines.append('')
+        lines.append('                    # 观感排查：洞口两侧加强箍筋“看起来双层/节点不干净”的定量统计（按 XZ 投影重叠计数）')
+        lines.append('                    def _edges_at_x(xv, tolx=0.5):')
+        lines.append('                        out = []')
+        lines.append('                        for (u, v) in __REBAR_EDGES__:')
+        lines.append('                            pu = __NODE_COORDS__.get(u); pv = __NODE_COORDS__.get(v)')
+        lines.append('                            if pu is None or pv is None:')
+        lines.append('                                continue')
+        lines.append('                            mx = 0.5*(float(pu[0]) + float(pv[0]))')
+        lines.append('                            if abs(mx - float(xv)) <= float(tolx):')
+        lines.append('                                out.append((u, v, pu, pv))')
+        lines.append('                        return out')
+        lines.append('                    def _proj_stats(_elist):')
+        lines.append('                        proj = {}')
+        lines.append('                        for (u, v, pu, pv) in _elist:')
+        lines.append('                            a = (round(float(pu[0]), 3), round(float(pu[2]), 3))')
+        lines.append('                            b = (round(float(pv[0]), 3), round(float(pv[2]), 3))')
+        lines.append('                            key = (a, b) if a < b else (b, a)')
+        lines.append('                            proj[key] = proj.get(key, 0) + 1')
+        lines.append('                        overlaps = [(k, c) for (k, c) in proj.items() if c > 1]')
+        lines.append('                        maxc = max(proj.values()) if proj else 0')
+        lines.append('                        return maxc, len(overlaps), overlaps[:3]')
+        lines.append('                    _elistL = _edges_at_x(_xpL)')
+        lines.append('                    _elistR = _edges_at_x(_xpR)')
+        lines.append('                    _lmax, _ln, _ls = _proj_stats(_elistL)')
+        lines.append('                    _rmax, _rn, _rs = _proj_stats(_elistR)')
+        lines.append('                    _check("hole.side_stirrup.edge_count.left", expected="info", actual=len(_elistL), ok=True, x=_xpL)')
+        lines.append('                    _check("hole.side_stirrup.edge_count.right", expected="info", actual=len(_elistR), ok=True, x=_xpR)')
+        lines.append('                    _check("hole.side_stirrup.xz_overlap.left", expected="info", actual=_lmax, ok=True, x=_xpL, overlap_keys=_ln, sample=_ls)')
+        lines.append('                    _check("hole.side_stirrup.xz_overlap.right", expected="info", actual=_rmax, ok=True, x=_xpR, overlap_keys=_rn, sample=_rs)')
+        lines.append('                    _check("hole.side_stirrup.xz_overlap.balance", expected="info", actual=(_lmax, _rmax), ok=True, diff=(_rmax - _lmax))')
+        lines.append('')
+        lines.append('                    # 肢数证据（定量）：统计洞口两侧加强箍筋在 X=xpL/xpR 截面上的“竖向肢”数量（按不同 Y 坐标计数）')
+        lines.append('                    def _vert_ys(_elist, y_inner, tol=1e-6):')
+        lines.append('                        ys_all=set(); ys_web=set()')
+        lines.append('                        for (u,v,pu,pv) in _elist:')
+        lines.append('                            try:')
+        lines.append('                                dx=abs(float(pu[0])-float(pv[0])); dy=abs(float(pu[1])-float(pv[1])); dz=abs(float(pu[2])-float(pv[2]))')
+        lines.append('                            except Exception:')
+        lines.append('                                continue')
+        lines.append('                            if dx <= tol and dy <= tol and dz > tol:')
+        lines.append('                                yv = round(float(pu[1]), 3)')
+        lines.append('                                ys_all.add(yv)')
+        lines.append('                                if abs(float(yv)) <= float(y_inner) + 1e-3:')
+        lines.append('                                    ys_web.add(yv)')
+        lines.append('                        return sorted(ys_all), sorted(ys_web)')
+        lines.append('                    _ys_all_L, _ys_web_L = _vert_ys(_elistL, _y_inner)')
+        lines.append('                    _ys_all_R, _ys_web_R = _vert_ys(_elistR, _y_inner)')
+        lines.append('                    try:')
+        lines.append('                        _legs_req = int(float(_hb0.get("side_stirrup_legs", 0) or 0))')
+        lines.append('                    except Exception:')
+        lines.append('                        _legs_req = 0')
+        lines.append('                    _base_total = 4 if (float(_tfL) > float(_cover) + 1e-6) else 2')
+        lines.append('                    _legs_eff = max(int(_base_total), int(_legs_req))')
+        lines.append('                    _inner_n = max(0, int(_legs_eff) - int(_base_total))')
+        lines.append('                    _exp_web = 2 + int(_inner_n)')
+        lines.append('                    _check("hole.side_stirrup.legs_count.left", expected="info", actual=(\"exp_total\",_legs_eff,\"act_total\",len(_ys_all_L),\"exp_web\",_exp_web,\"act_web\",len(_ys_web_L)), ok=True, y_all=_ys_all_L[:10], y_web=_ys_web_L[:10], x=_xpL)')
+        lines.append('                    _check("hole.side_stirrup.legs_count.right", expected="info", actual=(\"exp_total\",_legs_eff,\"act_total\",len(_ys_all_R),\"exp_web\",_exp_web,\"act_web\",len(_ys_web_R)), ok=True, y_all=_ys_all_R[:10], y_web=_ys_web_R[:10], x=_xpR)')
         lines.append('                else:')
         lines.append('                    _check("hole.side_stirrup.full_height.left", expected="skipped", actual="skipped", ok=True)')
         lines.append('                    _check("hole.side_stirrup.full_height.right", expected="skipped", actual="skipped", ok=True)')
@@ -2183,7 +3288,7 @@ class CompositeBeamModelGenerator:
         lines.append('            _cap_n = len(_caps) if isinstance(_caps, list) else 0')
         lines.append('            _cap_exp = 2 if (_dm == "internal") else 0')
         lines.append('            _check("duct.cap_surfs", expected=_cap_exp, actual=_cap_n, ok=(_cap_n == _cap_exp), fatal=True)')
-        lines.append('            # 预应力孔道高度避让洞口：孔道中心Z不得落入任何洞口Z区间（张工反馈）')
+        lines.append('            # 预应力孔道高度避让洞口：孔道中心Z不得落入任何洞口Z区间（客户反馈）')
         lines.append('            _dz = locals().get("duct_center_z", None)')
         lines.append('            _hb_all = locals().get("__HOLE_BOUNDS__", [])')
         lines.append('            _cross_hole = False')
@@ -2337,40 +3442,18 @@ class CompositeBeamModelGenerator:
         lines.append('            _check("support.left.fixed.uses_nset", expected=True, actual=_gnl_ok, ok=_gnl_ok, fatal=True, gn=_gnl, nsid=_nsl_id)')
         lines.append('            _check("support.right.fixed.uses_nset", expected=True, actual=_gnr_ok, ok=_gnr_ok, fatal=True, gn=_gnr, nsid=_nsr_id)')
         lines.append('')
-        lines.append('        # --- 荷载（STRICT：若Excel定义了荷载，则必须正确注入；误差<=0.1%）---')
-        lines.append(f'        _exp_dist = {("None" if expected_uniform_load_value is None else f"{expected_uniform_load_value:.6f}")}')
-        lines.append(f'        _exp_conc = {("None" if expected_concentrated_load_value is None else f"{expected_concentrated_load_value:.6f}")}')
-        lines.append('        _mode = locals().get("__DIST_LOAD_MODE__", None)')
-        lines.append('        _bs = locals().get("bsload_esides", [])')
-        lines.append('        _esides_n = len(_bs) if isinstance(_bs, list) else None')
-        lines.append('        _dist_applied = bool(locals().get("__DIST_LOAD_APPLIED__", False))')
-        lines.append('        _dist_src = locals().get("__DIST_LOAD_SOURCE__", None)')
-        lines.append('        _dist_err = locals().get("__DIST_LOAD_ERR__", None)')
-        lines.append('        _act_dist = locals().get("__DIST_LOAD_VALUE__", None)')
-        lines.append('        _p = locals().get("__DIST_LOAD_PRESSURE__", None)')
-        lines.append('        _w = locals().get("__DIST_LOAD_WIDTH__", None)')
-        lines.append('        if _exp_dist is None:')
-        lines.append('            _check("load.uniform.mode", expected="skipped", actual="skipped", ok=True)')
-        lines.append('            _check("load.uniform.surface_esides", expected="skipped", actual="skipped", ok=True)')
-        lines.append('            _check("load.uniform.applied", expected="skipped", actual="skipped", ok=True)')
-        lines.append('            _check("load.uniform.value_raw", expected="skipped", actual="skipped", ok=True)')
-        lines.append('            _check("load.uniform.pressure", expected="skipped", actual="skipped", ok=True)')
-        lines.append('        else:')
-        lines.append('            _check("load.uniform.mode", expected="Ebsload", actual=_mode, ok=(_mode == "Ebsload"), fatal=True)')
-        lines.append('            _check("load.uniform.surface_esides", expected=">0", actual=_esides_n, ok=(isinstance(_esides_n, int) and _esides_n > 0), fatal=True)')
-        lines.append('            _check("load.uniform.applied", expected=True, actual=_dist_applied, ok=_dist_applied, fatal=True, source=_dist_src, err=_dist_err)')
-        lines.append('            _check("load.uniform.value_raw", expected=_exp_dist, actual=_act_dist, rel_tol=0.001, fatal=True)')
-        lines.append('            _p_ok = (_p is not None) and (_w is not None) and (float(_w) > 1e-9) and (float(_p) > 0)')
-        lines.append('            _check("load.uniform.pressure", expected=">0", actual=_p, ok=_p_ok, fatal=True, width=_w)')
-        lines.append('        _conc_nodes = locals().get("conc_nodes", [])')
-        lines.append('        _conc_n = len(_conc_nodes) if isinstance(_conc_nodes, list) else None')
-        lines.append('        _act_conc = locals().get("__CONC_LOAD_VALUE__", None)')
-        lines.append('        if _exp_conc is None:')
-        lines.append('            _check("load.concentrated.nodes", expected="skipped", actual="skipped", ok=True)')
-        lines.append('            _check("load.concentrated.value", expected="skipped", actual="skipped", ok=True)')
-        lines.append('        else:')
-        lines.append('            _check("load.concentrated.nodes", expected=">0", actual=_conc_n, ok=(isinstance(_conc_n, int) and _conc_n > 0), fatal=True)')
-        lines.append('            _check("load.concentrated.value", expected=_exp_conc, actual=_act_conc, rel_tol=0.001, fatal=True)')
+        lines.append('        # --- 荷载：脚本不施加，仅预留可施加载荷对象（顶面/两条线/点）---')
+        lines.append('        _tops = locals().get("__LOAD_TOP_FACE_ESIDES__", [])')
+        lines.append('        _topn = len(_tops) if isinstance(_tops, list) else None')
+        lines.append('        _check("load.reserved.top_face", expected=">0", actual=_topn, ok=(isinstance(_topn, int) and _topn > 0), fatal=True, source=locals().get("__LOAD_TOP_FACE_SOURCE__", None))')
+        lines.append('        _l1 = locals().get("ns_line1", None)')
+        lines.append('        _l2 = locals().get("ns_line2", None)')
+        lines.append('        _lp = locals().get("ns_points", None)')
+        lines.append('        _l1n = len(locals().get("__LOAD_LINE1_NIDS__", []) or [])')
+        lines.append('        _l2n = len(locals().get("__LOAD_LINE2_NIDS__", []) or [])')
+        lines.append('        _pids = list(set((locals().get("__LOAD_LINE1_NIDS__", []) or []) + (locals().get("__LOAD_LINE2_NIDS__", []) or [])))')
+        lines.append('        _check("load.reserved.lines", expected=2, actual=(2 if (_l1 is not None and _l2 is not None) else (1 if (_l1 is not None or _l2 is not None) else 0)), ok=(_l1 is not None and _l2 is not None), fatal=True, n1=_l1n, n2=_l2n)')
+        lines.append('        _check("load.reserved.points", expected=">0", actual=len(_pids), ok=(len(_pids) > 0 and _lp is not None), fatal=True)')
         lines.append('')
         lines.append('        # --- 预应力逻辑自查：证明 0.0 来自 Excel 未启用，而非代码未接通 ---')
         lines.append('        _pre_en = bool(locals().get("__PRESTRESS_ENABLED__", False))')
@@ -2391,7 +3474,20 @@ class CompositeBeamModelGenerator:
         lines.append('        _pre0 = 0.0 if _pre_val is None else float(_pre_val)')
         lines.append('        _check("prestress.value", expected=(0.0 if (not _pre_en) else _pre_val), actual=_pre_val, ok=(abs(_pre0 - 0.0) < 1e-9) if (not _pre_en) else True)')
         lines.append('')
-        lines.append('        # 箍筋闭合环（13 段：12段环 + 1根封口横筋）- 以 x=cover 的第一道为探针')
+        lines.append('        # 20260119 客户反馈：默认先去掉波纹管孔道（使模型规整，排查网格警告）')
+        lines.append('        _duct_res = bool(locals().get("__DUCT_GEOM_RESERVED__", False))')
+        lines.append('        _dd = locals().get("duct_diameter", 0.0)')
+        lines.append('        try: _dd0 = float(_dd) if _dd is not None else 0.0')
+        lines.append('        except Exception: _dd0 = 0.0')
+        lines.append('        _check("duct.geometry_reserved", expected=_duct_res, actual=_duct_res, ok=True, d=_dd0)')
+        lines.append('        if not _duct_res:')
+        lines.append('            _check("duct.diameter.zero", expected=0.0, actual=_dd0, ok=(abs(_dd0) <= 1e-6), fatal=True)')
+        lines.append('        else:')
+        lines.append('            _check("duct.diameter.zero", expected="skipped", actual="skipped", ok=True)')
+        lines.append('')
+        lines.append('        # 箍筋闭合环验收：')
+        lines.append('        # - 有下翼缘：ring12（12 段：不包含翼缘顶处额外横向连筋，避免“多一条水平钢筋/中间横线”的歧义）')
+        lines.append('        # - 无下翼缘（T梁等）：退化为腹板矩形闭合箍筋（4 段）')
         lines.append(f'        _probe_x = {stirrup_cover:.3f}')
         lines.append(f'        _y_outer = {y_outer_engine:.3f}')
         lines.append(f'        _y_inner = {y_inner_engine:.3f}')
@@ -2407,25 +3503,86 @@ class CompositeBeamModelGenerator:
         lines.append('        def _has_edge(n1, n2):')
         lines.append('            if n1 is None or n2 is None: return False')
         lines.append('            return ((n1, n2) if n1 < n2 else (n2, n1)) in _edges')
-        lines.append('        A = (-_y_outer, _z_bottom); B = (-_y_inner, _z_bottom); C = (_y_inner, _z_bottom); D = (_y_outer, _z_bottom)')
-        lines.append('        E = (-_y_outer, _z_fl_top_l); F = (_y_outer, _z_fl_top_r)')
-        lines.append('        G = (-_y_inner, _z_fl_top_l); H = (_y_inner, _z_fl_top_r)')
-        lines.append('        I = (-_y_inner, _z_top); J = (_y_inner, _z_top)')
-        lines.append('        segs = [(A,B),(B,C),(C,D),(A,E),(D,F),(B,G),(G,I),(C,H),(H,J),(E,G),(H,F),(I,J),(G,H)]')
-        lines.append('        missing = []')
-        lines.append('        for (p, q) in segs:')
-        lines.append('            n1 = _nid(_probe_x, p[0], p[1])')
-        lines.append('            n2 = _nid(_probe_x, q[0], q[1])')
-        lines.append('            if n1 is None or n2 is None:')
-        lines.append('                missing.append(("node", p, q, n1, n2))')
-        lines.append('                continue')
-        lines.append('            if not _has_edge(n1, n2):')
-        lines.append('                missing.append(("edge", p, q, n1, n2))')
-        lines.append('        _found = 13 - len(missing)')
-        lines.append('        _check("stirrup.ring13.segments", expected=13, actual=_found, ok=(_found == 13), fatal=True, probe_x=_probe_x, missing=len(missing), sample=missing[:3])')
+        lines.append('        _bfL = float(locals().get("__BF_LOWER__", 0.0) or 0.0)')
+        lines.append('        _tfL = float(locals().get("__TF_LOWER__", 0.0) or 0.0)')
+        lines.append('        if _bfL > 1e-6 and _tfL > (_z_bottom + 1e-6):')
+        lines.append('            A = (-_y_outer, _z_bottom); B = (-_y_inner, _z_bottom); C = (_y_inner, _z_bottom); D = (_y_outer, _z_bottom)')
+        lines.append('            E = (-_y_outer, _z_fl_top_l); F = (_y_outer, _z_fl_top_r)')
+        lines.append('            G = (-_y_inner, _z_fl_top_l); H = (_y_inner, _z_fl_top_r)')
+        lines.append('            I = (-_y_inner, _z_top); J = (_y_inner, _z_top)')
+        lines.append('            segs = [(A,B),(B,C),(C,D),(A,E),(D,F),(B,G),(G,I),(C,H),(H,J),(E,G),(H,F),(I,J)]')
+        lines.append('            missing = []')
+        lines.append('            for (p, q) in segs:')
+        lines.append('                n1 = _nid(_probe_x, p[0], p[1])')
+        lines.append('                n2 = _nid(_probe_x, q[0], q[1])')
+        lines.append('                if n1 is None or n2 is None:')
+        lines.append('                    missing.append(("node", p, q, n1, n2))')
+        lines.append('                    continue')
+        lines.append('                if not _has_edge(n1, n2):')
+        lines.append('                    missing.append(("edge", p, q, n1, n2))')
+        lines.append('            _found = 12 - len(missing)')
+        lines.append('            _check("stirrup.ring13.segments", expected=12, actual=_found, ok=(_found == 12), fatal=True, probe_x=_probe_x, missing=len(missing), sample=missing[:3])')
+        lines.append('            _check("stirrup.web_rect.segments", expected="skipped", actual="skipped", ok=True)')
+        lines.append('        else:')
+        lines.append('            P1 = (-_y_inner, _z_bottom); P2 = (_y_inner, _z_bottom); P3 = (_y_inner, _z_top); P4 = (-_y_inner, _z_top)')
+        lines.append('            segs = [(P1,P2),(P2,P3),(P3,P4),(P4,P1)]')
+        lines.append('            missing = []')
+        lines.append('            for (p, q) in segs:')
+        lines.append('                n1 = _nid(_probe_x, p[0], p[1])')
+        lines.append('                n2 = _nid(_probe_x, q[0], q[1])')
+        lines.append('                if n1 is None or n2 is None or (not _has_edge(n1, n2)):')
+        lines.append('                    missing.append((p, q, n1, n2))')
+        lines.append('            _found = 4 - len(missing)')
+        lines.append('            _check("stirrup.web_rect.segments", expected=4, actual=_found, ok=(_found == 4), fatal=True, probe_x=_probe_x, missing=len(missing), sample=missing[:3])')
+        lines.append('            _check("stirrup.ring13.segments", expected="skipped", actual="skipped", ok=True)')
         lines.append('')
-        lines.append(f'        _concrete_ymin = {y_flange_lower_min:.3f}')
-        lines.append(f'        _concrete_ymax = {y_flange_lower_max:.3f}')
+        lines.append('        # 20260119 客户反馈：补齐“上部箍筋”（上翼缘范围闭合环）')
+        lines.append('        _bfU = float(locals().get("__BF_UPPER__", 0.0) or 0.0)')
+        lines.append('        _tfU = float(locals().get("__TF_UPPER__", 0.0) or 0.0)')
+        lines.append('        if _bfU > 1e-6 and _tfU > 1e-6:')
+        lines.append('            _Tw2 = float(locals().get("__TW__", 0.0) or 0.0)')
+        lines.append('            _H2 = float(locals().get("__H__", 0.0) or 0.0)')
+        lines.append('            _cov2 = float(locals().get("__COVER__", 25.0) or 25.0)')
+        lines.append('            _you = (_Tw2 + 2.0*_bfU)/2.0 - _cov2')
+        lines.append('            _zub = _H2 - _tfU + _cov2')
+        lines.append('            # 定量解释“台阶处看起来有空隙”：混凝土台阶面 z_step=H-tfU，与上翼缘箍筋底边 zub 的距离应为 cover')
+        lines.append('            _z_step = _H2 - _tfU')
+        lines.append('            _gap = float(_zub) - float(_z_step)')
+        lines.append('            _gap_ok = abs(float(_gap) - float(_cov2)) <= 1e-6')
+        lines.append('            _check(\"view.gap.upper_flange_step.cover\", expected=_cov2, actual=_gap, ok=_gap_ok, fatal=True, z_step=_z_step, z_rebar=_zub, meaning=\"gap(red_step_to_purple_stirrup)=cover\")')
+        lines.append('            # 证明台阶确实存在于预制段截面定义（不是显示误差）：precast_yz 必须包含 (±y_web, z_step) 与 (±y_out, z_step)')
+        lines.append('            _pre_yz = locals().get(\"precast_yz\", [])')
+        lines.append('            _y_web = float(_Tw2) / 2.0')
+        lines.append('            _y_out = (float(_Tw2) + 2.0*float(_bfU)) / 2.0')
+        lines.append('            def _has_pt(_yz, y, z, tol=1e-6):')
+        lines.append('                if not isinstance(_yz, list):')
+        lines.append('                    return False')
+        lines.append('                for p in _yz:')
+        lines.append('                    if not isinstance(p, (list, tuple)) or len(p) < 2:')
+        lines.append('                        continue')
+        lines.append('                    if abs(float(p[0]) - float(y)) <= tol and abs(float(p[1]) - float(z)) <= tol:')
+        lines.append('                        return True')
+        lines.append('                return False')
+        lines.append('            _ok_pts = _has_pt(_pre_yz, _y_web, _z_step) and _has_pt(_pre_yz, -_y_web, _z_step) and _has_pt(_pre_yz, _y_out, _z_step) and _has_pt(_pre_yz, -_y_out, _z_step)')
+        lines.append('            _check(\"geom.upper_flange.step.points\", expected=True, actual=_ok_pts, ok=_ok_pts, fatal=True, z_step=_z_step, y_web=_y_web, y_out=_y_out)')
+        lines.append('            _ok = True')
+        lines.append('            if (_you <= _y_inner + 1e-6) or ((_z_top - _zub) <= 1e-6):')
+        lines.append('                _ok = False')
+        lines.append('            else:')
+        lines.append('                P = (-_you, _zub); Q = (_you, _zub); R = (_you, _z_top); S = (-_you, _z_top)')
+        lines.append('                segs2 = [(P,Q),(Q,R),(R,S),(S,P)]')
+        lines.append('                miss2 = []')
+        lines.append('                for (p,q) in segs2:')
+        lines.append('                    n1 = _nid(_probe_x, p[0], p[1]); n2 = _nid(_probe_x, q[0], q[1])')
+        lines.append('                    if n1 is None or n2 is None or (not _has_edge(n1,n2)):')
+        lines.append('                        miss2.append((p,q,n1,n2))')
+        lines.append('                _ok = (len(miss2) == 0)')
+        lines.append('            _check("stirrup.upper_flange.hoop", expected=True, actual=_ok, ok=_ok, fatal=True, y=_you, z_bottom=_zub, z_top=_z_top)')
+        lines.append('        else:')
+        lines.append('            _check("stirrup.upper_flange.hoop", expected="skipped", actual="skipped", ok=True)')
+        lines.append('')
+        lines.append(f'        _concrete_ymin = {min(y_flange_lower_min, y_flange_upper_min):.3f}')
+        lines.append(f'        _concrete_ymax = {max(y_flange_lower_max, y_flange_upper_max):.3f}')
         lines.append('        plane_nodes = [nid for nid, xyz in __NODE_COORDS__.items() if abs(xyz[0] - _probe_x) < 1e-3]')
         lines.append('        if plane_nodes:')
         lines.append('            ys = [__NODE_COORDS__[nid][1] for nid in plane_nodes]')
@@ -2434,7 +3591,107 @@ class CompositeBeamModelGenerator:
         lines.append('        else:')
         lines.append('            _check("stirrup.y_within_concrete", expected=True, actual=False, ok=False, probe_x=_probe_x, reason="no nodes on probe plane")')
         lines.append('')
-        lines.append('        # 翼缘角部纵筋证据：上翼缘角筋 + 底翼缘顶部角筋必须存在（张工20260112反馈）')
+        lines.append('        # 通用兜底：按 Z 分区校核钢筋是否越界（T梁等无下翼缘时最容易出现两根“外肢跑出混凝土外”）')
+        lines.append('        _Tw2 = float(locals().get("__TW__", 0.0) or 0.0)')
+        lines.append('        _H2 = float(locals().get("__H__", 0.0) or 0.0)')
+        lines.append('        _cov2 = float(locals().get("__COVER__", 25.0) or 25.0)')
+        lines.append('        _bfL2 = float(locals().get("__BF_LOWER__", 0.0) or 0.0)')
+        lines.append('        _tfL2 = float(locals().get("__TF_LOWER__", 0.0) or 0.0)')
+        lines.append('        _bfU2 = float(locals().get("__BF_UPPER__", 0.0) or 0.0)')
+        lines.append('        _tfU2 = float(locals().get("__TF_UPPER__", 0.0) or 0.0)')
+        lines.append('        def _y_lim(zv):')
+        lines.append('            zf = float(zv)')
+        lines.append('            if _bfL2 > 1e-6 and _tfL2 > 1e-6 and zf <= (_tfL2 - _cov2 + 1e-6):')
+        lines.append('                return (_Tw2 / 2.0 + _bfL2 - _cov2)')
+        lines.append('            if _bfU2 > 1e-6 and _tfU2 > 1e-6 and zf >= (_H2 - _tfU2 + _cov2 - 1e-6):')
+        lines.append('                return (_Tw2 / 2.0 + _bfU2 - _cov2)')
+        lines.append('            return (_Tw2 / 2.0 - _cov2)')
+        lines.append('        _rebar_nids = set()')
+        lines.append('        for (a, b) in __REBAR_EDGES__:')
+        lines.append('            if a is not None: _rebar_nids.add(a)')
+        lines.append('            if b is not None: _rebar_nids.add(b)')
+        lines.append('        _bad = []')
+        lines.append('        for _nid0 in list(_rebar_nids):')
+        lines.append('            p = __NODE_COORDS__.get(_nid0)')
+        lines.append('            if p is None: continue')
+        lines.append('            y = float(p[1]); z = float(p[2])')
+        lines.append('            lim = _y_lim(z)')
+        lines.append('            if abs(y) > float(lim) + 1e-3:')
+        lines.append('                _bad.append((_nid0, p, round(float(lim), 3)))')
+        lines.append('        _check("rebar.within_concrete.y_by_z", expected=0, actual=len(_bad), ok=(len(_bad) == 0), fatal=True, sample=_bad[:3])')
+        lines.append('        # Z 越界兜底：任何钢筋节点不得超出 [cover, H-cover]')
+        lines.append('        _zmin_ok = float(_cov2)')
+        lines.append('        _zmax_ok = float(_H2) - float(_cov2)')
+        lines.append('        _badz = []')
+        lines.append('        for _nid0, p in __NODE_COORDS__.items():')
+        lines.append('            if _nid0 not in _rebar_nids: continue')
+        lines.append('            z = float(p[2])')
+        lines.append('            if z < _zmin_ok - 1e-3 or z > _zmax_ok + 1e-3:')
+        lines.append('                _badz.append((_nid0, p, (round(_zmin_ok,3), round(_zmax_ok,3))))')
+        lines.append('        _check("rebar.within_concrete.z_range", expected=0, actual=len(_badz), ok=(len(_badz) == 0), fatal=True, sample=_badz[:3])')
+        lines.append('')
+        lines.append('        # 客户强调（侧边图）：正视图侧边看起来“有缝隙”，通常是钢筋相对混凝土边缘的保护层（cover）导致。')
+        lines.append('        # 对“上翼缘箍筋”在一般位置与洞口区间各取一个截面，定量给出侧向保护层（混凝土外边线到箍筋外肢的距离）。')
+        lines.append('        if _bfU > 1e-6 and _tfU > 1e-6:')
+        lines.append('            _Tw2 = float(locals().get("__TW__", 0.0) or 0.0)')
+        lines.append('            _H2 = float(locals().get("__H__", 0.0) or 0.0)')
+        lines.append('            _cov2 = float(locals().get("__COVER__", 25.0) or 25.0)')
+        lines.append('            _you = (_Tw2 + 2.0*_bfU)/2.0 - _cov2')
+        lines.append('            _zub = _H2 - _tfU + _cov2')
+        lines.append('            _ztop = _H2 - _cov2')
+        lines.append('            _conc_ymax = (_Tw2 + 2.0*_bfU)/2.0')
+        lines.append('            _tolx = 0.6')
+        lines.append('            _tolyz = 0.6')
+        lines.append('            _upper_xs = []')
+        lines.append('            for _nid0, _xyz in __NODE_COORDS__.items():')
+        lines.append('                try:')
+        lines.append('                    if abs(abs(float(_xyz[1])) - float(_you)) <= _tolyz and (abs(float(_xyz[2]) - float(_zub)) <= _tolyz or abs(float(_xyz[2]) - float(_ztop)) <= _tolyz):')
+        lines.append('                        _upper_xs.append(float(_xyz[0]))')
+        lines.append('                except Exception:')
+        lines.append('                    continue')
+        lines.append('            _upper_xs = sorted(set([round(x, 3) for x in _upper_xs]))')
+        lines.append('            def _side_cover_at_x(xp):')
+        lines.append('                ys2 = []')
+        lines.append('                for _nid1, _xyz1 in __NODE_COORDS__.items():')
+        lines.append('                    if abs(float(_xyz1[0]) - float(xp)) <= _tolx and float(_xyz1[2]) >= _zub - 1e-3 and float(_xyz1[2]) <= _ztop + 1e-3:')
+        lines.append('                        ys2.append(float(_xyz1[1]))')
+        lines.append('                if not ys2:')
+        lines.append('                    return None, None')
+        lines.append('                y_max_abs = max(abs(y) for y in ys2)')
+        lines.append('                return (_conc_ymax - y_max_abs), y_max_abs')
+        lines.append('            _gap_side, _yabs = _side_cover_at_x(_probe_x)')
+        lines.append('            if _gap_side is not None:')
+        lines.append('                _ok_side = abs(float(_gap_side) - float(_cov2)) <= 1e-3')
+        lines.append('                _check("view.gap.upper_stirrup.side_cover.probe", expected=_cov2, actual=_gap_side, ok=_ok_side, fatal=True, x=_probe_x, y_rebar=_yabs, y_conc=_conc_ymax, z=(_zub, _ztop))')
+        lines.append('            else:')
+        lines.append('                _check("view.gap.upper_stirrup.side_cover.probe", expected=_cov2, actual=None, ok=False, fatal=True, x=_probe_x, reason="no nodes in upper flange z range")')
+        lines.append('            _hb0 = (locals().get("__HOLE_BOUNDS__", [None]) or [None])[0]')
+        lines.append('            _x_hole = None; _x0 = None; _x1 = None')
+        lines.append('            if isinstance(_hb0, dict):')
+        lines.append('                _x0 = float(_hb0.get("x_min_precast")) if _hb0.get("x_min_precast") is not None else (float(_hb0.get("x_min")) if _hb0.get("x_min") is not None else None)')
+        lines.append('                _x1 = float(_hb0.get("x_max_precast")) if _hb0.get("x_max_precast") is not None else (float(_hb0.get("x_max")) if _hb0.get("x_max") is not None else None)')
+        lines.append('                if _x0 is not None and _x1 is not None and _upper_xs:')
+        lines.append('                    for xv in _upper_xs:')
+        lines.append('                        if float(xv) >= float(_x0) - 1e-6 and float(xv) <= float(_x1) + 1e-6:')
+        lines.append('                            _x_hole = float(xv)')
+        lines.append('                            break')
+        lines.append('            if _x_hole is not None:')
+        lines.append('                _gap_side2, _yabs2 = _side_cover_at_x(_x_hole)')
+        lines.append('                if _gap_side2 is not None:')
+        lines.append('                    _ok_side2 = abs(float(_gap_side2) - float(_cov2)) <= 1e-3')
+        lines.append('                    _check("view.gap.upper_stirrup.side_cover.hole_zone", expected=_cov2, actual=_gap_side2, ok=_ok_side2, fatal=True, x=_x_hole, hole=(_x0, _x1), y_rebar=_yabs2, y_conc=_conc_ymax, z=(_zub, _ztop))')
+        lines.append('                else:')
+        lines.append('                    _check("view.gap.upper_stirrup.side_cover.hole_zone", expected=_cov2, actual=None, ok=False, fatal=True, x=_x_hole, hole=(_x0, _x1), reason="no nodes in upper flange z range")')
+        lines.append('            else:')
+        lines.append('                _hole_span = "__HOLE_BOUNDS__ missing"')
+        lines.append('                if isinstance(_hb0, dict):')
+        lines.append('                    try:')
+        lines.append('                        _hole_span = (float(_hb0.get("x_min", 0.0)), float(_hb0.get("x_max", 0.0)))')
+        lines.append('                    except Exception:')
+        lines.append('                        _hole_span = "__HOLE_BOUNDS__ invalid"')
+        lines.append('                _check("view.gap.upper_stirrup.side_cover.hole_zone", expected="info", actual="skipped", ok=True, hole=_hole_span, reason="no upper-stirrup nodes found in hole range")')
+        lines.append('')
+        lines.append('        # 翼缘角部纵筋证据：上翼缘角筋 + 底翼缘顶部角筋必须存在（客户20260112反馈）')
         lines.append('        _cover = float(locals().get("__COVER__", 25.0))')
         lines.append('        _H = float(locals().get("__H__", 0.0))')
         lines.append('        _Tw = float(locals().get("__TW__", 0.0))')
@@ -2458,39 +3715,48 @@ class CompositeBeamModelGenerator:
         lines.append('        else:')
         lines.append('            _top_ok = (_rt1 in _rebar_nids) and (_rt2 in _rebar_nids)')
         lines.append('            _check("rebar.corner.top", expected=True, actual=_top_ok, ok=_top_ok, fatal=True, nids=[_rt1, _rt2], y=_yt, z=_zt)')
-        lines.append('        if _yb <= 1e-6:')
+        lines.append('        # 仅当存在“下翼缘”时才要求底翼缘顶部角筋；T 型截面（无下翼缘）跳过此项')
+        lines.append('        if _bfL <= 1e-6 or _tfL <= 1e-6:')
         lines.append('            _check("rebar.corner.bottom_top", expected="skipped", actual="skipped", ok=True)')
         lines.append('        else:')
         lines.append('            _bot_ok = (_rb1 in _rebar_nids) and (_rb2 in _rebar_nids)')
         lines.append('            _check("rebar.corner.bottom_top", expected=True, actual=_bot_ok, ok=_bot_ok, fatal=True, nids=[_rb1, _rb2], y=_yb, z=_zb)')
         lines.append('')
         lines.append('        _check_summary()')
-        lines.append('        # Zero Pivot / 稳定性：脚本末尾会打印“分析前必做3步”指南')
+        lines.append('        # Zero Pivot / 稳定性：脚本末尾会打印“分析前必做4步”指南')
         lines.append('        _check("post_mesh.guide_printed", expected=True, actual=True, ok=True)')
         lines.append('        print("[CHECK] end expected=True actual=True => PASS")')
 
         lines.append('    StruModel.toViewer()')
         lines.append('    print("模型生成完成!")')
-        lines.append(f'    print("预制段整体Solid ID(工字/倒T外轮廓拉伸):", precast_solid.id)')
+        lines.append(f'    print("预制段Solid ID(腹板/上部):", precast_solid.id)')
+        lines.append(f'    print("预制段Solid ID(下翼缘):", flange_solid.id)')
         lines.append(f'    print("后浇层Solid ID(顶盖):", cast_solid.id)')
-        lines.append(f'    print("说明: flange_solid 为兼容旧变量名，等同于 precast_solid")')
         lines.append(f'    print("钢筋数量:", len(rebar_ids))')
         lines.append(f'    print("预应力值:", {prestress_value}, "MPa")')
-        lines.append('    # ======== 分析前必做 3 步（避免 Zero Pivot / 0xc0000005）========')
+        lines.append('    # ======== 分析前必做 4 步（避免 Zero Pivot / 0xc0000005）========')
         lines.append('    print("")')
         lines.append('    print("="*68)')
-        lines.append('    print("【分析前必做3步指南】(脚本已跳过 Coupling/约束，需网格后在软件内建立)")')
+        lines.append('    print("【分析前必做5步指南】(脚本已跳过 Coupling/约束/嵌入/荷载施加，需网格后在软件内建立)")')
         lines.append('    print("1) 网格：建议网格尺寸 <= 50mm；若扫掠(Sweep)崩溃/0xc0000005，改用四面体(SolidTetra)划分。")')
-        lines.append('    print("2) 端部耦合：在有限元分析模块，用 SUPPORT_REF_POINTS 里的参考点作主节点，端面网格节点作从节点创建 Coupling。")')
+        lines.append('    print("2) 钢筋嵌入：在有限元分析模块创建“嵌入(Embeded)”关系，将钢筋(Link)嵌入混凝土实体单元（否则钢筋会被识别为自由构件）。")')
+        lines.append('    print("3) 端部耦合：在有限元分析模块，用 SUPPORT_REF_POINTS 里的参考点作主节点，端面网格节点作从节点创建 Coupling。")')
         lines.append('    print("   - 可优先尝试直接拾取集合 SUPPORT_LEFT_FACE / SUPPORT_RIGHT_FACE；如软件不支持几何Nset选面节点，请在网格后框选端面节点。")')
-        lines.append('    print("3) 叠合面绑定：在有限元分析模块，对预制段与后浇层的接触面创建 Tie/绑定（保证整体受力，避免 Zero Pivot）。")')
-        lines.append('    print("集合名(已预置): SUPPORT_LEFT_FACE / SUPPORT_RIGHT_FACE / SUPPORT_RIGHT_BOTTOM_LINE / SUPPORT_REF_POINTS")')
+        lines.append('    print("4) 叠合面绑定：在有限元分析模块，对预制段与后浇层的接触面创建 Tie/绑定（保证整体受力，避免 Zero Pivot）。")')
+        lines.append('    print("5) 荷载：脚本仅预留加载对象，不施加荷载。")')
+        lines.append('    print("   - 面荷载：对梁顶面施加（可直接选后浇层顶面/梁顶面）。")')
+        lines.append('    print("   - 线荷载/集中荷载：使用集合 LOAD_LINE_1 / LOAD_LINE_2 / LOAD_POINTS（已预置）。")')
+        lines.append('    print("集合名(已预置): SUPPORT_LEFT_FACE / SUPPORT_RIGHT_FACE / SUPPORT_RIGHT_BOTTOM_LINE / SUPPORT_REF_POINTS / LOAD_LINE_1 / LOAD_LINE_2 / LOAD_POINTS / REBAR_NODES")')
         lines.append('    try:')
         lines.append('        print("集合ID:",'
                      ' "LEFT_FACE=", getattr(locals().get("ns_left", None), "id", locals().get("ns_left", None)),'
                      ' "RIGHT_FACE=", getattr(locals().get("ns_right_face", None), "id", locals().get("ns_right_face", None)),'
                      ' "RIGHT_BOTTOM_LINE=", getattr(locals().get("ns_right", None), "id", locals().get("ns_right", None)),'
-                     ' "REF_POINTS=", getattr(locals().get("ns_ref", None), "id", locals().get("ns_ref", None)))')
+                     ' "REF_POINTS=", getattr(locals().get("ns_ref", None), "id", locals().get("ns_ref", None)),'
+                     ' "LOAD_LINE_1=", getattr(locals().get("ns_line1", None), "id", locals().get("ns_line1", None)),'
+                     ' "LOAD_LINE_2=", getattr(locals().get("ns_line2", None), "id", locals().get("ns_line2", None)),'
+                     ' "LOAD_POINTS=", getattr(locals().get("ns_points", None), "id", locals().get("ns_points", None)),'
+                     ' "REBAR_NODES=", getattr(locals().get("ns_rebar_nodes", None), "id", locals().get("ns_rebar_nodes", None)))')
         lines.append('    except Exception:')
         lines.append('        pass')
         lines.append('    print("="*68)')

@@ -124,10 +124,13 @@ class LongitudinalRebar:
     支持"主筋 + 附加筋"模式，处理 L/3 截断逻辑
     """
     # 必填字段（没有默认值）
-    left_support_top_A: RebarSpec
+    # 顶部通长筋（全跨）：优先读取 Position="Top Through"，否则兼容旧模板的 "Mid Span Top"
     mid_span_top: RebarSpec
-    right_support_top_A: RebarSpec
     bottom_through_A: RebarSpec
+
+    # 可选：支座附加筋（左右可不同），用于在支座区叠加配筋便于理解/验收
+    left_support_top_A: Optional[RebarSpec] = None
+    right_support_top_A: Optional[RebarSpec] = None
 
     # 可选字段（有默认值）
     left_support_top_B: Optional[RebarSpec] = None
@@ -135,6 +138,25 @@ class LongitudinalRebar:
     right_support_top_B: Optional[RebarSpec] = None
     right_support_length: float = 0.0  # 右支座区长度，默认 L/3
     bottom_through_B: Optional[RebarSpec] = None
+
+    # 多排纵筋（沿 Z 方向叠排）
+    # 说明：
+    # - 该功能用于满足“2排/3排纵筋 + 竖向间距可输入”的需求
+    # - 当前策略：对顶部/底部纵筋整体叠排（支座区/跨中区都应用），每排的直径/根数沿用该区的既有设置
+    top_rows: int = 1
+    top_row_spacing: float = 0.0  # mm，净距（中心距按 dia + spacing 处理）
+    bottom_rows: int = 1
+    bottom_row_spacing: float = 0.0  # mm，净距（中心距按 dia + spacing 处理）
+
+    def __post_init__(self):
+        if self.top_rows < 1:
+            raise ValueError(f"顶部纵筋排数必须>=1，当前值: {self.top_rows}")
+        if self.bottom_rows < 1:
+            raise ValueError(f"底部纵筋排数必须>=1，当前值: {self.bottom_rows}")
+        if self.top_row_spacing < 0:
+            raise ValueError(f"顶部纵筋竖向间距不能为负，当前值: {self.top_row_spacing}")
+        if self.bottom_row_spacing < 0:
+            raise ValueError(f"底部纵筋竖向间距不能为负，当前值: {self.bottom_row_spacing}")
 
 
 @dataclass
@@ -176,10 +198,17 @@ class HoleParams:
     fillet_radius: float = 0.0 # 倒角半径 (mm) - T+3预留，T+7实现
 
     # 小梁配筋（洞口上下形成的微型梁）
+    # 兼容旧字段：不区分洞口顶/底时，使用该直径/数量（新字段为 0 时回退）
     small_beam_long_diameter: float = 0.0  # 纵筋直径 (mm)
     small_beam_long_count: int = 0         # 纵筋根数
+    # 新字段：洞口顶部/底部加强纵筋分别配置（客户20260127反馈）
+    small_beam_long_top_diameter: float = 0.0
+    small_beam_long_top_count: int = 0
+    small_beam_long_bottom_diameter: float = 0.0
+    small_beam_long_bottom_count: int = 0
     small_beam_stirrup_diameter: float = 0.0  # 箍筋直径 (mm)
     small_beam_stirrup_spacing: float = 0.0   # 箍筋间距 (mm)
+    small_beam_stirrup_legs: int = 0          # 小梁箍筋肢数（0=自动，建议4）
 
     # 洞侧补强箍筋
     left_reinf_length: float = 0.0      # 左侧补强区长度 (mm)

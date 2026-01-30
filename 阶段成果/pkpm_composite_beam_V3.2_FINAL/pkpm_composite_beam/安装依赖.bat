@@ -1,5 +1,4 @@
 @echo off
-chcp 65001 >nul
 echo ========================================
 echo  PKPM-CAE Install Dependencies
 echo ========================================
@@ -8,7 +7,7 @@ echo Installing Python libraries...
 echo.
 
 python -m pip install --upgrade pip
-python -m pip install -r requirements.txt --no-deps
+python -m pip install -r requirements.txt
 
 if errorlevel 1 (
     echo.
@@ -22,7 +21,7 @@ if errorlevel 1 (
     echo.
     echo [SUCCESS] Dependencies installed!
     echo.
-    echo You can now run: Run_UI.bat
+    echo You can now run: 运行_UI界面.bat
 )
 
 echo.

@@ -57,6 +57,18 @@ class RebarEngine:
         """
         self.geometry = geometry
 
+    @staticmethod
+    def _tag_elements_diameter(elements: List, diameter: float) -> None:
+        try:
+            d = float(diameter)
+        except Exception:
+            return
+        for e in elements or []:
+            try:
+                setattr(e, "diameter", d)
+            except Exception:
+                pass
+
     def _effective_hp(self) -> float:
         """
         叠合面有效高度 hp (mm)
@@ -80,7 +92,8 @@ class RebarEngine:
         return float(getattr(g, "h_pre", 0.0) or 0.0)
 
     def create_longitudinal_rebars(self, long_rebar: LongitudinalRebar,
-                                   cover: float = 25.0) -> Dict[str, List]:
+                                   cover: float = 25.0,
+                                   holes: List[HoleParams] = None) -> Dict[str, List]:
         """
         创建纵向配筋
 
@@ -118,50 +131,65 @@ class RebarEngine:
 
         # 1. 创建顶部钢筋
         top_rebars_result = self._create_top_rebars(
-            long_rebar, L, H, top_width, cover, left_len, right_len
+            long_rebar, L, H, top_width, cover, left_len, right_len, holes=holes
         )
         all_nodes.extend(top_rebars_result['nodes'])
         all_elements.extend(top_rebars_result['elements'])
         top_rebars.extend(top_rebars_result['elements'])
+        top_through = list(top_rebars_result.get('through', []) or [])
+        top_left_support_A = list(top_rebars_result.get('left_A', []) or [])
+        top_left_support_B = list(top_rebars_result.get('left_B', []) or [])
+        top_right_support_A = list(top_rebars_result.get('right_A', []) or [])
+        top_right_support_B = list(top_rebars_result.get('right_B', []) or [])
 
         # 1B. 上翼缘角部纵筋自动补齐（至少两根角筋，避免只在腹板范围布筋）
+        top_corner_auto = []
         try:
             y_corner = top_width / 2 - cover
-            if y_corner > 1e-6 and getattr(long_rebar, "left_support_top_A", None):
+            if y_corner > 1e-6 and getattr(long_rebar, "mid_span_top", None):
                 corner_nodes, corner_elems = self._create_rebar_line(
                     x_start=0, x_end=L,
                     z=H - cover,
                     y_positions=[-y_corner, y_corner],
-                    diameter=float(long_rebar.left_support_top_A.diameter)
+                    diameter=float(long_rebar.mid_span_top.diameter),
+                    holes=holes
                 )
                 all_nodes.extend(corner_nodes)
                 all_elements.extend(corner_elems)
                 top_rebars.extend(corner_elems)
+                top_corner_auto.extend(corner_elems)
         except Exception:
             pass
 
         # 2. 创建底部通长筋 (考虑翼缘厚度tf)
         bottom_rebars_result = self._create_bottom_rebars(
-            long_rebar, L, H, Tw, cover, tf
+            long_rebar, L, H, Tw, cover, tf, holes=holes
         )
         all_nodes.extend(bottom_rebars_result['nodes'])
         all_elements.extend(bottom_rebars_result['elements'])
         bottom_rebars.extend(bottom_rebars_result['elements'])
+        bottom_through_A = list(bottom_rebars_result.get('through_A', []) or [])
+        bottom_through_B = list(bottom_rebars_result.get('through_B', []) or [])
 
-        # 2B. 底部翼缘顶部角部纵筋（z=tf_lower-cover）：角点至少有钢筋（张工反馈）
+        # 2B. 底部翼缘顶部角部纵筋（z=tf_lower-cover）：角点至少有钢筋（客户反馈）
+        # 2B. 底部翼缘顶部角部纵筋仅适用于存在下翼缘的截面
+        bottom_corner_auto = []
         try:
-            y_corner = bottom_width / 2 - cover
-            z_flange_top = max(cover, float(tf) - cover)
-            if y_corner > 1e-6 and z_flange_top > cover + 1e-6 and getattr(long_rebar, "bottom_through_A", None):
-                corner_nodes, corner_elems = self._create_rebar_line(
-                    x_start=0, x_end=L,
-                    z=z_flange_top,
-                    y_positions=[-y_corner, y_corner],
-                    diameter=float(long_rebar.bottom_through_A.diameter)
-                )
-                all_nodes.extend(corner_nodes)
-                all_elements.extend(corner_elems)
-                bottom_rebars.extend(corner_elems)
+            if bf_lower > 1e-6:
+                y_corner = bottom_width / 2 - cover
+                z_flange_top = max(cover, float(tf) - cover)
+                if y_corner > 1e-6 and z_flange_top > cover + 1e-6 and getattr(long_rebar, "bottom_through_A", None):
+                    corner_nodes, corner_elems = self._create_rebar_line(
+                        x_start=0, x_end=L,
+                        z=z_flange_top,
+                        y_positions=[-y_corner, y_corner],
+                        diameter=float(long_rebar.bottom_through_A.diameter),
+                        holes=holes
+                    )
+                    all_nodes.extend(corner_nodes)
+                    all_elements.extend(corner_elems)
+                    bottom_rebars.extend(corner_elems)
+                    bottom_corner_auto.extend(corner_elems)
         except Exception:
             pass
 
@@ -169,19 +197,58 @@ class RebarEngine:
             'top_rebars': top_rebars,
             'bottom_rebars': bottom_rebars,
             'all_nodes': all_nodes,
-            'all_elements': all_elements
+            'all_elements': all_elements,
+            # 纵筋分组证据（不含自动角筋）
+            'top_through': top_through,
+            'top_left_support_A': top_left_support_A,
+            'top_left_support_B': top_left_support_B,
+            'top_right_support_A': top_right_support_A,
+            'top_right_support_B': top_right_support_B,
+            'bottom_through_A': bottom_through_A,
+            'bottom_through_B': bottom_through_B,
+            # 自动角筋（不纳入“通长筋/支座筋”验收计数，避免掩盖缺筋）
+            'top_corner_auto': top_corner_auto,
+            'bottom_corner_auto': bottom_corner_auto,
         }
+
+    @staticmethod
+    def _stacked_zs(base_z: float, rows: int, spacing: float, diameter: float, direction: int) -> List[float]:
+        """
+        计算多排纵筋的 Z 坐标列表（按中心距叠排）。
+
+        Args:
+            base_z: 第1排的Z坐标
+            rows: 排数（>=1）
+            spacing: 净距(mm)，中心距采用 (dia + spacing)
+            diameter: 钢筋直径(mm)
+            direction: +1 向上叠排；-1 向下叠排
+        """
+        try:
+            n = max(1, int(rows))
+        except Exception:
+            n = 1
+        try:
+            sp = max(0.0, float(spacing))
+        except Exception:
+            sp = 0.0
+        try:
+            d = max(0.0, float(diameter))
+        except Exception:
+            d = 0.0
+        step = (d + sp) if d > 1e-6 else sp
+        return [float(base_z) + float(direction) * float(i) * float(step) for i in range(n)]
 
     def _create_top_rebars(self, long_rebar: LongitudinalRebar,
                           L: float, H: float, section_width: float, cover: float,
-                          left_len: float, right_len: float) -> Dict:
+                          left_len: float, right_len: float,
+                          holes: List[HoleParams] = None) -> Dict:
         """
         创建顶部纵向钢筋（支座区 + 跨中区）
 
         逻辑：
-        - 左支座区：0 ~ left_len，布置 A组 + B组
-        - 跨中区：left_len ~ (L - right_len)，布置跨中钢筋
-        - 右支座区：(L - right_len) ~ L，布置 A组 + B组
+        - 顶部通长筋：0 ~ L（由 long_rebar.mid_span_top 提供；兼容旧模板“Mid Span Top”命名）
+        - 左支座附加筋：0 ~ left_len（由 left_support_top_A/B 提供）
+        - 右支座附加筋：(L - right_len) ~ L（由 right_support_top_A/B 提供）
 
         Args:
             long_rebar: 纵向配筋参数
@@ -194,77 +261,142 @@ class RebarEngine:
         """
         nodes = []
         elements = []
+        # 证据化分组（用于验收：通长筋 vs 支座附加筋独立）
+        through = []
+        left_A = []
+        left_B = []
+        right_A = []
+        right_B = []
 
-        # 顶部钢筋 Z 坐标（距顶面 cover）
-        z_top = H - cover
+        # 顶部钢筋 Z 坐标（距顶面 cover）；支持多排叠排（向下）
+        z_top_base = H - cover
 
-        # 左支座 A 组（通长）
-        left_a_nodes, left_a_elems = self._create_rebar_line(
-            x_start=0, x_end=left_len,
-            z=z_top, y_positions=self._calculate_rebar_y_positions(
-                section_width, long_rebar.left_support_top_A.count, cover
-            ),
-            diameter=long_rebar.left_support_top_A.diameter
+        # 1) 顶部通长筋（全跨）
+        z_top_list_through = self._stacked_zs(
+            base_z=z_top_base,
+            rows=getattr(long_rebar, "top_rows", 1),
+            spacing=getattr(long_rebar, "top_row_spacing", 0.0),
+            diameter=float(long_rebar.mid_span_top.diameter),
+            direction=-1,
         )
-        nodes.extend(left_a_nodes)
-        elements.extend(left_a_elems)
+        for z_top in z_top_list_through:
+            through_nodes, through_elems = self._create_rebar_line(
+                x_start=0, x_end=L,
+                z=z_top, y_positions=self._calculate_rebar_y_positions(
+                    section_width, long_rebar.mid_span_top.count, cover
+                ),
+                diameter=long_rebar.mid_span_top.diameter,
+                holes=holes
+            )
+            nodes.extend(through_nodes)
+            elements.extend(through_elems)
+            through.extend(through_elems)
+
+        # 2) 左支座附加筋
+        if getattr(long_rebar, "left_support_top_A", None):
+            z_top_list_la = self._stacked_zs(
+                base_z=z_top_base,
+                rows=getattr(long_rebar, "top_rows", 1),
+                spacing=getattr(long_rebar, "top_row_spacing", 0.0),
+                diameter=float(long_rebar.left_support_top_A.diameter),
+                direction=-1,
+            )
+            for z_top in z_top_list_la:
+                left_a_nodes, left_a_elems = self._create_rebar_line(
+                    x_start=0, x_end=left_len,
+                    z=z_top, y_positions=self._calculate_rebar_y_positions(
+                        section_width, long_rebar.left_support_top_A.count, cover
+                    ),
+                    diameter=long_rebar.left_support_top_A.diameter,
+                    holes=holes
+                )
+                nodes.extend(left_a_nodes)
+                elements.extend(left_a_elems)
+                left_A.extend(left_a_elems)
 
         # 左支座 B 组（附加筋，如果有）
         if long_rebar.left_support_top_B:
             extend_len = long_rebar.left_support_top_B.extend_length
-            left_b_nodes, left_b_elems = self._create_rebar_line(
-                x_start=0, x_end=min(left_len + extend_len, L),
-                z=z_top, y_positions=self._calculate_rebar_y_positions(
-                    section_width, long_rebar.left_support_top_B.count, cover,
-                    offset=long_rebar.left_support_top_A.count
-                ),
-                diameter=long_rebar.left_support_top_B.diameter
+            z_top_list_b = self._stacked_zs(
+                base_z=z_top_base,
+                rows=getattr(long_rebar, "top_rows", 1),
+                spacing=getattr(long_rebar, "top_row_spacing", 0.0),
+                diameter=float(long_rebar.left_support_top_B.diameter),
+                direction=-1,
             )
-            nodes.extend(left_b_nodes)
-            elements.extend(left_b_elems)
+            for z_top in z_top_list_b:
+                left_b_nodes, left_b_elems = self._create_rebar_line(
+                    x_start=0, x_end=min(left_len + extend_len, L),
+                    z=z_top, y_positions=self._calculate_rebar_y_positions(
+                        section_width, long_rebar.left_support_top_B.count, cover,
+                        offset=(long_rebar.left_support_top_A.count if getattr(long_rebar, "left_support_top_A", None) else 0)
+                    ),
+                    diameter=long_rebar.left_support_top_B.diameter,
+                    holes=holes
+                )
+                nodes.extend(left_b_nodes)
+                elements.extend(left_b_elems)
+                left_B.extend(left_b_elems)
 
-        # 跨中区钢筋
-        mid_start = left_len
-        mid_end = L - right_len
-        mid_nodes, mid_elems = self._create_rebar_line(
-            x_start=mid_start, x_end=mid_end,
-            z=z_top, y_positions=self._calculate_rebar_y_positions(
-                section_width, long_rebar.mid_span_top.count, cover
-            ),
-            diameter=long_rebar.mid_span_top.diameter
-        )
-        nodes.extend(mid_nodes)
-        elements.extend(mid_elems)
-
-        # 右支座 A 组（通长）
-        right_a_nodes, right_a_elems = self._create_rebar_line(
-            x_start=L - right_len, x_end=L,
-            z=z_top, y_positions=self._calculate_rebar_y_positions(
-                section_width, long_rebar.right_support_top_A.count, cover
-            ),
-            diameter=long_rebar.right_support_top_A.diameter
-        )
-        nodes.extend(right_a_nodes)
-        elements.extend(right_a_elems)
+        # 3) 右支座附加筋
+        if getattr(long_rebar, "right_support_top_A", None):
+            z_top_list_ra = self._stacked_zs(
+                base_z=z_top_base,
+                rows=getattr(long_rebar, "top_rows", 1),
+                spacing=getattr(long_rebar, "top_row_spacing", 0.0),
+                diameter=float(long_rebar.right_support_top_A.diameter),
+                direction=-1,
+            )
+            for z_top in z_top_list_ra:
+                right_a_nodes, right_a_elems = self._create_rebar_line(
+                    x_start=L - right_len, x_end=L,
+                    z=z_top, y_positions=self._calculate_rebar_y_positions(
+                        section_width, long_rebar.right_support_top_A.count, cover
+                    ),
+                    diameter=long_rebar.right_support_top_A.diameter,
+                    holes=holes
+                )
+                nodes.extend(right_a_nodes)
+                elements.extend(right_a_elems)
+                right_A.extend(right_a_elems)
 
         # 右支座 B 组（附加筋，如果有）
         if long_rebar.right_support_top_B:
             extend_len = long_rebar.right_support_top_B.extend_length
-            right_b_nodes, right_b_elems = self._create_rebar_line(
-                x_start=max(L - right_len - extend_len, 0), x_end=L,
-                z=z_top, y_positions=self._calculate_rebar_y_positions(
-                    section_width, long_rebar.right_support_top_B.count, cover,
-                    offset=long_rebar.right_support_top_A.count
-                ),
-                diameter=long_rebar.right_support_top_B.diameter
+            z_top_list_rb = self._stacked_zs(
+                base_z=z_top_base,
+                rows=getattr(long_rebar, "top_rows", 1),
+                spacing=getattr(long_rebar, "top_row_spacing", 0.0),
+                diameter=float(long_rebar.right_support_top_B.diameter),
+                direction=-1,
             )
-            nodes.extend(right_b_nodes)
-            elements.extend(right_b_elems)
+            for z_top in z_top_list_rb:
+                right_b_nodes, right_b_elems = self._create_rebar_line(
+                    x_start=max(L - right_len - extend_len, 0), x_end=L,
+                    z=z_top, y_positions=self._calculate_rebar_y_positions(
+                        section_width, long_rebar.right_support_top_B.count, cover,
+                        offset=(long_rebar.right_support_top_A.count if getattr(long_rebar, "right_support_top_A", None) else 0)
+                    ),
+                    diameter=long_rebar.right_support_top_B.diameter,
+                    holes=holes
+                )
+                nodes.extend(right_b_nodes)
+                elements.extend(right_b_elems)
+                right_B.extend(right_b_elems)
 
-        return {'nodes': nodes, 'elements': elements}
+        return {
+            'nodes': nodes,
+            'elements': elements,
+            'through': through,
+            'left_A': left_A,
+            'left_B': left_B,
+            'right_A': right_A,
+            'right_B': right_B,
+        }
 
     def _create_bottom_rebars(self, long_rebar: LongitudinalRebar,
-                             L: float, H: float, Tw: float, cover: float, tf: float) -> Dict:
+                             L: float, H: float, Tw: float, cover: float, tf: float,
+                             holes: List[HoleParams] = None) -> Dict:
         """
         创建底部通长筋
 
@@ -279,10 +411,11 @@ class RebarEngine:
         """
         nodes = []
         elements = []
+        through_A = []
+        through_B = []
 
-        # 【关键修正】底部受拉主筋必须放在翼缘（翅膀）内部，不是腹板！
-        # Z坐标 = 底部保护层厚度（约30mm），钢筋铺在最底下的大翼缘板内
-        z_bottom = cover  # 25~30mm，在翼缘实体内
+        # 底部受拉主筋：第1排Z坐标 = 底部保护层厚度；支持多排叠排（向上）
+        z_bottom_base = cover  # 25~30mm，在翼缘实体内
 
         # 【关键修正】底筋分布在翼缘总宽内，不是腹板宽
         # 翼缘总宽 = Tw + 2*bf
@@ -291,30 +424,50 @@ class RebarEngine:
         flange_width = Tw + 2 * bf  # 翼缘总宽（如 250+2*200=650mm）
 
         # 底部 A 组（通长，从0到L，Y分布在翼缘总宽内）
-        bottom_a_nodes, bottom_a_elems = self._create_rebar_line(
-            x_start=0, x_end=L,
-            z=z_bottom, y_positions=self._calculate_rebar_y_positions(
-                flange_width, long_rebar.bottom_through_A.count, cover
-            ),
-            diameter=long_rebar.bottom_through_A.diameter
+        z_bottom_list_a = self._stacked_zs(
+            base_z=z_bottom_base,
+            rows=getattr(long_rebar, "bottom_rows", 1),
+            spacing=getattr(long_rebar, "bottom_row_spacing", 0.0),
+            diameter=float(long_rebar.bottom_through_A.diameter),
+            direction=+1,
         )
-        nodes.extend(bottom_a_nodes)
-        elements.extend(bottom_a_elems)
+        for z_bottom in z_bottom_list_a:
+            bottom_a_nodes, bottom_a_elems = self._create_rebar_line(
+                x_start=0, x_end=L,
+                z=z_bottom, y_positions=self._calculate_rebar_y_positions(
+                    flange_width, long_rebar.bottom_through_A.count, cover
+                ),
+                diameter=long_rebar.bottom_through_A.diameter,
+                holes=holes
+            )
+            nodes.extend(bottom_a_nodes)
+            elements.extend(bottom_a_elems)
+            through_A.extend(bottom_a_elems)
 
         # 底部 B 组（如果有，也是通长，Y分布在翼缘总宽内）
         if long_rebar.bottom_through_B and long_rebar.bottom_through_B.count > 0:
-            bottom_b_nodes, bottom_b_elems = self._create_rebar_line(
-                x_start=0, x_end=L,
-                z=z_bottom, y_positions=self._calculate_rebar_y_positions(
-                    flange_width, long_rebar.bottom_through_B.count, cover,
-                    offset=long_rebar.bottom_through_A.count
-                ),
-                diameter=long_rebar.bottom_through_B.diameter
+            z_bottom_list_b = self._stacked_zs(
+                base_z=z_bottom_base,
+                rows=getattr(long_rebar, "bottom_rows", 1),
+                spacing=getattr(long_rebar, "bottom_row_spacing", 0.0),
+                diameter=float(long_rebar.bottom_through_B.diameter),
+                direction=+1,
             )
-            nodes.extend(bottom_b_nodes)
-            elements.extend(bottom_b_elems)
+            for z_bottom in z_bottom_list_b:
+                bottom_b_nodes, bottom_b_elems = self._create_rebar_line(
+                    x_start=0, x_end=L,
+                    z=z_bottom, y_positions=self._calculate_rebar_y_positions(
+                        flange_width, long_rebar.bottom_through_B.count, cover,
+                        offset=long_rebar.bottom_through_A.count
+                    ),
+                    diameter=long_rebar.bottom_through_B.diameter,
+                    holes=holes
+                )
+                nodes.extend(bottom_b_nodes)
+                elements.extend(bottom_b_elems)
+                through_B.extend(bottom_b_elems)
 
-        return {'nodes': nodes, 'elements': elements}
+        return {'nodes': nodes, 'elements': elements, 'through_A': through_A, 'through_B': through_B}
 
     def _calculate_rebar_y_positions(self, section_width: float, count: int,
                                      cover: float, offset: int = 0) -> List[float]:
@@ -339,23 +492,30 @@ class RebarEngine:
         if count == 1:
             return [0.0]  # 单根钢筋居中
 
-        # 多根钢筋等间距分布
+        # 多根钢筋等间距分布（默认：端点落在保护层内侧）
         spacing = effective_width / (count - 1)
-        y_positions = []
+        y_positions = [-effective_width / 2 + i * spacing for i in range(count)]
 
-        for i in range(count):
-            y = -effective_width / 2 + i * spacing
-            y_positions.append(y)
-
-        # 如果有偏移，微调位置避免重合
+        # 附加筋避开主筋：用“合并后的等分序列”选取未被主筋占用的位置（保持对称、且不突破保护层）
         if offset > 0:
-            y_positions = [y + cover * 0.5 for y in y_positions]
+            total = int(count) + int(offset)
+            if total >= 2 and offset >= 2:
+                all_spacing = effective_width / (total - 1)
+                all_pos = [-effective_width / 2 + i * all_spacing for i in range(total)]
+                used = {
+                    int(round(i * (total - 1) / (offset - 1)))
+                    for i in range(offset)
+                }
+                cand = [all_pos[i] for i in range(total) if i not in used]
+                if len(cand) == count:
+                    y_positions = cand
 
         return y_positions
 
     def _create_rebar_line(self, x_start: float, x_end: float,
                           z: float, y_positions: List[float],
-                          diameter: float, num_segments: int = 30) -> Tuple[List, List]:
+                          diameter: float, num_segments: int = 30,
+                          holes: List[HoleParams] = None) -> Tuple[List, List]:
         """
         创建一组平行钢筋（沿 X 方向）
 
@@ -372,6 +532,35 @@ class RebarEngine:
         nodes = []
         elements = []
 
+        # 洞口避让：钢筋不得穿过洞口真空区域（hole_void 内不允许出现任何钢筋线段）
+        Tw = float(getattr(self.geometry, "Tw", 0.0) or 0.0)
+        hole_pad = float(getattr(self, "HOLE_EDGE_CLEARANCE", 2.0) or 2.0)
+        hole_spans = []
+        if holes:
+            for h in holes:
+                try:
+                    x0, x1, z0, z1 = h.get_bounds()
+                    hole_spans.append((float(x0) - hole_pad, float(x1) + hole_pad,
+                                       float(z0) - hole_pad, float(z1) + hole_pad))
+                except Exception:
+                    continue
+
+        def _seg_hits_hole(xa: float, xb: float, yv: float, zv: float) -> bool:
+            if not hole_spans:
+                return False
+            # 洞口贯通腹板厚度（Y方向），仅需判断该筋是否落在腹板厚度范围内
+            if Tw <= 1e-6 or abs(float(yv)) > (Tw / 2.0 - 1e-6):
+                return False
+            for hx0, hx1, hz0, hz1 in hole_spans:
+                # 纵筋为常Z线：只要其 z 落在洞口高度范围内，即视为穿洞
+                if float(zv) <= hz0 + 1e-6 or float(zv) >= hz1 - 1e-6:
+                    continue
+                lo = min(float(xa), float(xb))
+                hi = max(float(xa), float(xb))
+                if hi > hx0 + 1e-6 and lo < hx1 - 1e-6:
+                    return True
+            return False
+
         # 计算X方向分段点
         x_points = [x_start + i * (x_end - x_start) / num_segments
                    for i in range(num_segments + 1)]
@@ -386,7 +575,15 @@ class RebarEngine:
 
             # 创建 Link 单元连接节点
             for i in range(len(rebar_nodes) - 1):
+                xa = float(rebar_nodes[i].x)
+                xb = float(rebar_nodes[i + 1].x)
+                if _seg_hits_hole(xa, xb, float(y), float(z)):
+                    continue
                 elem = Element([rebar_nodes[i].id, rebar_nodes[i+1].id], etype=EleType.Link)
+                try:
+                    elem.diameter = float(diameter)
+                except Exception:
+                    pass
                 elements.append(elem)
 
         return nodes, elements
@@ -411,29 +608,26 @@ class RebarEngine:
         Tw = self.geometry.Tw
         cover = stirrup.cover
 
-        # 【关键】翼缘厚度 - 左右独立，用于自适应箍筋高度
-        tf_ll = max(self.geometry.tf_ll, 100.0)  # 左下翼缘厚度，默认100mm
-        tf_rl = max(self.geometry.tf_rl, 100.0)  # 右下翼缘厚度，默认100mm
-        # 翼缘伸出宽度：取上下翼缘最大值（避免上翼缘更宽时箍筋仍按下翼缘宽度生成）
-        bf = max(
-            float(getattr(self.geometry, "bf_ll", 0.0) or 0.0),
-            float(getattr(self.geometry, "bf_rl", 0.0) or 0.0),
-            float(getattr(self.geometry, "bf_lu", 0.0) or 0.0),
-            float(getattr(self.geometry, "bf_ru", 0.0) or 0.0),
-            0.0
-        )
-        flange_width = Tw + 2 * bf  # 翼缘总宽 650mm
+        # 【关键】下翼缘参数（左右独立，用于自适应箍筋“外侧短肢”高度）
+        bf_ll = float(getattr(self.geometry, "bf_ll", 0.0) or 0.0)
+        bf_rl = float(getattr(self.geometry, "bf_rl", 0.0) or 0.0)
+        tf_ll = float(getattr(self.geometry, "tf_ll", 0.0) or 0.0)
+        tf_rl = float(getattr(self.geometry, "tf_rl", 0.0) or 0.0)
+        bf_lower = max(bf_ll, bf_rl, 0.0)
+        # 下翼缘总宽（用于“下翼缘外侧短肢”）
+        flange_width_lower = Tw + 2.0 * bf_lower
 
         # 【关键修正】箍筋Y坐标分布
-        # 外侧肢 Y = ±(flange_width/2 - cover) = ±300mm
-        # 内侧肢 Y = ±(Tw/2 - cover) = ±100mm
-        y_outer = flange_width / 2 - cover  # 300mm (外侧肢Y坐标)
+        # - 若存在下翼缘：外侧肢 Y = ±(下翼缘宽/2 - cover)
+        # - 若不存在下翼缘（T梁等）：退化为腹板矩形箍筋（y_outer=y_inner），避免出现“外肢跑到混凝土外面”
+        y_outer = flange_width_lower / 2.0 - cover if bf_lower > 1e-6 else (Tw / 2.0 - cover)
         y_inner = Tw / 2 - cover            # 100mm (内侧肢Y坐标)
 
         # 箍筋Z坐标 - 自适应高度
         z_bottom = cover                           # 底部Z=25mm
-        z_flange_top_left = tf_ll - cover          # 左翼缘顶Z（自适应）
-        z_flange_top_right = tf_rl - cover         # 右翼缘顶Z（自适应）
+        # 外侧短肢仅在“下翼缘厚度范围”内存在；没有下翼缘则高度退化到 z_bottom
+        z_flange_top_left = (tf_ll - cover) if (bf_ll > 1e-6 and tf_ll > cover + 1e-6) else z_bottom
+        z_flange_top_right = (tf_rl - cover) if (bf_rl > 1e-6 and tf_rl > cover + 1e-6) else z_bottom
         z_top = H - cover                          # 顶部Z=775mm
 
         # 箍筋高度分段（用于调试输出）
@@ -446,7 +640,7 @@ class RebarEngine:
         normal_stirrups = []
 
         # 洞口避让：洞宽范围内屏蔽全局箍筋（仅允许洞口补强筋出现）
-        # 额外扩大 2mm：避免箍筋恰好落在洞口边界线上（张工反馈：洞口中心不允许钢筋穿过）
+        # 额外扩大 2mm：避免箍筋恰好落在洞口边界线上（客户反馈：洞口中心不允许钢筋穿过）
         skip_ranges = []
         if holes:
             for h in holes:
@@ -605,6 +799,70 @@ class RebarEngine:
         nodes = []
         elements = []
 
+        # 2肢箍筋：按腹板矩形闭合（不引入外侧短肢/中间横筋）
+        # 无下翼缘（T梁等）：同样退化为腹板矩形闭合箍筋，避免“外侧短肢”越界
+        if int(legs) <= 2 or abs(float(y_outer) - float(y_inner)) <= 1e-6:
+            n1 = Node(x, -y_inner, z_bottom)
+            n2 = Node(x,  y_inner, z_bottom)
+            n3 = Node(x,  y_inner, z_top)
+            n4 = Node(x, -y_inner, z_top)
+            nodes.extend([n1, n2, n3, n4])
+            elements.extend([
+                Element([n1.id, n2.id], etype=EleType.Link),
+                Element([n2.id, n3.id], etype=EleType.Link),
+                Element([n3.id, n4.id], etype=EleType.Link),
+                Element([n4.id, n1.id], etype=EleType.Link),
+            ])
+            self._tag_elements_diameter(elements, diameter)
+
+            # 4肢及以上：添加中间内拉筋（贯通全高）
+            if int(legs) >= 4:
+                inner_leg_count = legs - 2
+                if inner_leg_count > 0:
+                    inner_spacing = (2 * y_inner) / (inner_leg_count + 1)
+                    for i in range(1, inner_leg_count + 1):
+                        y_mid = -y_inner + i * inner_spacing
+                        n_mid_bottom = Node(x, y_mid, z_bottom)
+                        n_mid_top = Node(x, y_mid, z_top)
+                        nodes.extend([n_mid_bottom, n_mid_top])
+                        e_mid = Element([n_mid_bottom.id, n_mid_top.id], etype=EleType.Link)
+                        try:
+                            e_mid.diameter = float(diameter)
+                        except Exception:
+                            pass
+                        elements.append(e_mid)
+
+            # 上翼缘闭合环：仍按原逻辑补齐（若存在上翼缘）
+            try:
+                g = self.geometry
+                H = float(getattr(g, "H", 0.0) or 0.0)
+                Tw = float(getattr(g, "Tw", 0.0) or 0.0)
+                cover_est = Tw / 2.0 - float(y_inner)
+                bf_upper = max(float(getattr(g, "bf_lu", 0.0) or 0.0), float(getattr(g, "bf_ru", 0.0) or 0.0))
+                tf_upper = max(float(getattr(g, "tf_lu", 0.0) or 0.0), float(getattr(g, "tf_ru", 0.0) or 0.0))
+                if bf_upper > 1e-6 and tf_upper > 1e-6 and cover_est > 0:
+                    top_width = (Tw + 2.0 * bf_upper) if bf_upper > 1e-6 else Tw
+                    y_outer_upper = top_width / 2.0 - cover_est
+                    z_upper_bottom = H - tf_upper + cover_est
+                    if y_outer_upper > float(y_inner) + 1e-6 and (z_top - z_upper_bottom) > 1e-6:
+                        u1 = Node(x, -y_outer_upper, z_upper_bottom)
+                        u2 = Node(x, y_outer_upper, z_upper_bottom)
+                        u3 = Node(x, -y_outer_upper, z_top)
+                        u4 = Node(x, y_outer_upper, z_top)
+                        nodes.extend([u1, u2, u3, u4])
+                        _up_elems = [
+                            Element([u1.id, u2.id], etype=EleType.Link),
+                            Element([u2.id, u4.id], etype=EleType.Link),
+                            Element([u4.id, u3.id], etype=EleType.Link),
+                            Element([u3.id, u1.id], etype=EleType.Link),
+                        ]
+                        self._tag_elements_diameter(_up_elems, diameter)
+                        elements.extend(_up_elems)
+            except Exception:
+                pass
+
+            return nodes, elements
+
         # === 创建10个关键节点 ===
         # 外侧4个底角（在翼缘底部 Z=z_bottom）
         n1 = Node(x, -y_outer, z_bottom)    # 左外底 Y=-300
@@ -652,30 +910,74 @@ class RebarEngine:
         # 顶部横向边（腹板宽度）
         e10 = Element([n9.id, n10.id], etype=EleType.Link)  # 顶边
 
-        # 【张工反馈#7-封口】预制层顶部（腹板与底翼缘交接面）增加一根横向封口筋：
-        # 在 z=z_flange_top 位置连接两根内侧肢，形成“预制段闭合矩形框”
-        e13 = Element([n7.id, n8.id], etype=EleType.Link)   # 封口横筋（+1段）
+        # 注：不在 z=z_flange_top 处额外添加横向连筋，避免出现“多一条水平钢筋/中间横线”的观感与肢数歧义
+        elements.extend([e1, e2, e3, e4, e5, e6, e7, e8, e9, e10, e11, e12])
+        self._tag_elements_diameter(elements, diameter)
 
-        elements.extend([e1, e2, e3, e4, e5, e6, e7, e8, e9, e10, e11, e12, e13])
+        # === 多肢箍筋：添加中间内肢（避免把 4 肢误生成成 6 肢）===
+        # 约定：
+        # - 工字/倒T等存在下翼缘外肢时，基础肢数=4（±y_outer 外肢 + ±y_inner 内肢）
+        # - 无下翼缘时退化为腹板矩形，基础肢数=2（±y_inner）
+        # legs 表示“目标总肢数”，不足基础肢数时按基础肢数处理。
+        try:
+            legs_req = int(legs)
+        except Exception:
+            legs_req = 0
+        base_legs = 4 if abs(float(y_outer) - float(y_inner)) > 1e-6 else 2
+        legs_eff = max(base_legs, legs_req)
+        inner_leg_count = max(0, int(legs_eff) - int(base_legs))
+        if inner_leg_count > 0 and float(y_inner) > 1e-6:
+            inner_spacing = (2.0 * float(y_inner)) / float(inner_leg_count + 1)
+            for i in range(1, inner_leg_count + 1):
+                y_mid = -float(y_inner) + float(i) * float(inner_spacing)
+                # 中间内肢：从底部贯通到顶部（不添加任何中间横向连杆）
+                n_mid_bottom = Node(x, y_mid, z_bottom)
+                n_mid_top = Node(x, y_mid, z_top)
+                nodes.extend([n_mid_bottom, n_mid_top])
+                e_mid = Element([n_mid_bottom.id, n_mid_top.id], etype=EleType.Link)
+                try:
+                    e_mid.diameter = float(diameter)
+                except Exception:
+                    pass
+                elements.append(e_mid)
 
-        # === 4肢及以上：添加中间内拉筋 ===
-        if legs >= 4:
-            inner_leg_count = legs - 2
-            if inner_leg_count > 0:
-                inner_spacing = (2 * y_inner) / (inner_leg_count + 1)
-                for i in range(1, inner_leg_count + 1):
-                    y_mid = -y_inner + i * inner_spacing
-                    # 中间内拉筋：从底部贯通到顶部
-                    n_mid_bottom = Node(x, y_mid, z_bottom)
-                    n_mid_top = Node(x, y_mid, z_top)
-                    nodes.extend([n_mid_bottom, n_mid_top])
-                    e_mid = Element([n_mid_bottom.id, n_mid_top.id], etype=EleType.Link)
-                    elements.append(e_mid)
+        # === 20260119 客户反馈：补齐“上部箍筋”（上翼缘范围的闭合环）===
+        # 说明：原 ring13 的外侧短肢仅在下翼缘范围内；此处为上翼缘补一个“闭合矩形环”，
+        # 仅位于上翼缘厚度范围内（不影响原 ring13 13段自检）。
+        try:
+            g = self.geometry
+            H = float(getattr(g, "H", 0.0) or 0.0)
+            Tw = float(getattr(g, "Tw", 0.0) or 0.0)
+            # 由 y_inner 反推 cover（y_inner = Tw/2 - cover）
+            cover_est = Tw / 2.0 - float(y_inner)
+            bf_upper = max(float(getattr(g, "bf_lu", 0.0) or 0.0), float(getattr(g, "bf_ru", 0.0) or 0.0))
+            tf_upper = max(float(getattr(g, "tf_lu", 0.0) or 0.0), float(getattr(g, "tf_ru", 0.0) or 0.0))
+            if bf_upper > 1e-6 and tf_upper > 1e-6 and cover_est > 0:
+                top_width = (Tw + 2.0 * bf_upper) if bf_upper > 1e-6 else Tw
+                y_outer_upper = top_width / 2.0 - cover_est
+                z_upper_bottom = H - tf_upper + cover_est
+                # 需要至少留出 2*cover 的实体厚度
+                if y_outer_upper > float(y_inner) + 1e-6 and (z_top - z_upper_bottom) > 1e-6:
+                    u1 = Node(x, -y_outer_upper, z_upper_bottom)
+                    u2 = Node(x, y_outer_upper, z_upper_bottom)
+                    u3 = Node(x, -y_outer_upper, z_top)
+                    u4 = Node(x, y_outer_upper, z_top)
+                    nodes.extend([u1, u2, u3, u4])
+                    _up_elems = [
+                        Element([u1.id, u2.id], etype=EleType.Link),  # 上翼缘底边
+                        Element([u2.id, u4.id], etype=EleType.Link),  # 右竖边
+                        Element([u4.id, u3.id], etype=EleType.Link),  # 上翼缘顶边
+                        Element([u3.id, u1.id], etype=EleType.Link),  # 左竖边
+                    ]
+                    self._tag_elements_diameter(_up_elems, diameter)
+                    elements.extend(_up_elems)
+        except Exception:
+            pass
 
         return nodes, elements
 
     # ========== 洞口加强筋 ==========
-    def create_hole_reinforcement(self, hole, tf_lower: float) -> Dict:
+    def create_hole_reinforcement(self, hole, tf_lower: float, cover: float = 25.0) -> Dict:
         """
         创建洞口加强配筋
 
@@ -705,7 +1007,11 @@ class RebarEngine:
         Tw = self.geometry.Tw
         hp = self._effective_hp()
         H = self.geometry.H
-        cover = 25.0  # 保护层
+        try:
+            cover = float(cover)
+        except Exception:
+            cover = 25.0
+        cover = max(0.0, cover)
 
         # 洞口几何
         hx = hole.x                    # 洞口中心X
@@ -716,56 +1022,89 @@ class RebarEngine:
         # 洞口边界
         x_left = hx - hw / 2           # 洞口左边
         x_right = hx + hw / 2          # 洞口右边
-        z_bottom = hz - hh / 2         # 洞口底
-        z_top = hz + hh / 2            # 洞口顶
+        z_bottom_raw = hz - hh / 2     # 洞口底(原始)
+        z_top_raw = hz + hh / 2        # 洞口顶(原始)
+        # 与几何开孔保持一致：洞口底边不得低于下翼缘顶(tf_lower)，无下翼缘时至少不贴到底面(>=cover+1mm)
+        try:
+            tf_lower = float(tf_lower)
+        except Exception:
+            tf_lower = 0.0
+        z_bottom = max(float(z_bottom_raw), float(tf_lower), float(cover) + 1.0)
+        if abs(float(z_bottom) - float(tf_lower)) <= 1e-6 and float(tf_lower) > (float(cover) + 1.0 + 1e-6):
+            z_bottom = float(z_bottom) + 1.0
+        z_top = float(z_top_raw)
         edge_clear = float(self.HOLE_EDGE_CLEARANCE)
 
-        # 1. 创建洞口顶底纵筋（小梁纵筋）
-        if hole.small_beam_long_count > 0 and hole.small_beam_long_diameter > 0:
+        # 1. 创建洞口顶底纵筋（小梁纵筋）：支持顶/底分别配置（新字段为0则回退旧字段）
+        top_long_dia = float(getattr(hole, "small_beam_long_top_diameter", 0.0) or 0.0)
+        top_long_cnt = int(getattr(hole, "small_beam_long_top_count", 0) or 0)
+        bot_long_dia = float(getattr(hole, "small_beam_long_bottom_diameter", 0.0) or 0.0)
+        bot_long_cnt = int(getattr(hole, "small_beam_long_bottom_count", 0) or 0)
+        legacy_dia = float(getattr(hole, "small_beam_long_diameter", 0.0) or 0.0)
+        legacy_cnt = int(getattr(hole, "small_beam_long_count", 0) or 0)
+        if top_long_cnt <= 0 or top_long_dia <= 0:
+            top_long_cnt, top_long_dia = legacy_cnt, legacy_dia
+        if bot_long_cnt <= 0 or bot_long_dia <= 0:
+            bot_long_cnt, bot_long_dia = legacy_cnt, legacy_dia
+
+        if (top_long_cnt > 0 and top_long_dia > 0) or (bot_long_cnt > 0 and bot_long_dia > 0):
             extend = hole.reinf_extend_length if hole.reinf_extend_length > 0 else 300  # 默认锚固300mm
 
-            # 顶部纵筋
-            top_result = self._create_hole_longitudinal_rebars(
-                x_start=x_left - extend,
-                x_end=x_right + extend,
-                z=z_top + cover,  # 洞口顶面上方
-                y_width=Tw,
-                count=hole.small_beam_long_count,
-                diameter=hole.small_beam_long_diameter,
-                cover=cover
-            )
-            all_nodes.extend(top_result['nodes'])
-            all_elements.extend(top_result['elements'])
-            top_long_rebars.extend(top_result['elements'])
+            # 防呆：洞口靠近梁顶/梁底时，纵筋标高不能越出混凝土外表面
+            # 顶部纵筋：理想位置=洞口顶面上方 cover；若超出梁顶保护层位置，则下压到 H-cover
+            z_top_bar_raw = float(z_top) + float(cover)
+            z_top_bar_max = float(H) - float(cover)
+            z_top_bar = min(z_top_bar_raw, z_top_bar_max)
+            # 底部纵筋：理想位置=洞口底面下方 cover；若低于梁底保护层位置，则上抬到 cover
+            z_bot_bar_raw = float(z_bottom) - float(cover)
+            z_bot_bar_min = float(cover)
+            z_bot_bar = max(z_bot_bar_raw, z_bot_bar_min)
+            if abs(z_top_bar - z_top_bar_raw) > 1e-6:
+                print(f">>> 警告: 洞口顶纵筋标高超出梁顶，已调整: raw={z_top_bar_raw:.1f} -> {z_top_bar:.1f} (H={H:.1f}, cover={cover:.1f})")
+            if abs(z_bot_bar - z_bot_bar_raw) > 1e-6:
+                print(f">>> 警告: 洞口底纵筋标高低于梁底，已调整: raw={z_bot_bar_raw:.1f} -> {z_bot_bar:.1f} (cover={cover:.1f})")
 
-            # 底部纵筋
-            bottom_result = self._create_hole_longitudinal_rebars(
-                x_start=x_left - extend,
-                x_end=x_right + extend,
-                z=z_bottom - cover,  # 洞口底面下方
-                y_width=Tw,
-                count=hole.small_beam_long_count,
-                diameter=hole.small_beam_long_diameter,
-                cover=cover
-            )
-            all_nodes.extend(bottom_result['nodes'])
-            all_elements.extend(bottom_result['elements'])
-            bottom_long_rebars.extend(bottom_result['elements'])
+            if top_long_cnt > 0 and top_long_dia > 0:
+                top_result = self._create_hole_longitudinal_rebars(
+                    x_start=x_left - extend,
+                    x_end=x_right + extend,
+                    z=z_top_bar,  # 洞口顶面上方（必要时下压到梁顶保护层）
+                    y_width=Tw,
+                    count=top_long_cnt,
+                    diameter=top_long_dia,
+                    cover=cover,
+                    holes=[hole]
+                )
+                all_nodes.extend(top_result['nodes'])
+                all_elements.extend(top_result['elements'])
+                top_long_rebars.extend(top_result['elements'])
 
-            print(f">>> 【洞口补强】顶底纵筋: {hole.small_beam_long_count}根 x Φ{hole.small_beam_long_diameter}, 锚固{extend}mm")
+            if bot_long_cnt > 0 and bot_long_dia > 0:
+                bottom_result = self._create_hole_longitudinal_rebars(
+                    x_start=x_left - extend,
+                    x_end=x_right + extend,
+                    z=z_bot_bar,  # 洞口底面下方（必要时上抬到梁底保护层）
+                    y_width=Tw,
+                    count=bot_long_cnt,
+                    diameter=bot_long_dia,
+                    cover=cover,
+                    holes=[hole]
+                )
+                all_nodes.extend(bottom_result['nodes'])
+                all_elements.extend(bottom_result['elements'])
+                bottom_long_rebars.extend(bottom_result['elements'])
+
+            print(f">>> 【洞口补强】顶纵筋: {top_long_cnt}根 x Φ{top_long_dia}, 底纵筋: {bot_long_cnt}根 x Φ{bot_long_dia}, 锚固{extend}mm")
 
         # 2. 创建洞口侧边加强箍筋
         if hole.side_stirrup_spacing > 0 and hole.side_stirrup_diameter > 0:
-            # 【张工反馈】洞口两侧加强箍筋的高度应与全局箍筋一致：贯通梁顶/梁底
+            # 【客户反馈】洞口两侧加强箍筋的高度应与全局箍筋一致：贯通梁顶/梁底
             # 这里采用工字型 ring13 形状（与全局箍筋同形同高），仅在洞口两侧加密范围内生成。
-            bf = max(
-                float(getattr(self.geometry, "bf_ll", 0.0) or 0.0),
-                float(getattr(self.geometry, "bf_rl", 0.0) or 0.0),
-                float(getattr(self.geometry, "bf_lu", 0.0) or 0.0),
-                float(getattr(self.geometry, "bf_ru", 0.0) or 0.0),
-            )
-            flange_width = Tw + 2 * bf
-            y_outer = flange_width / 2 - cover
+            bf_ll = float(getattr(self.geometry, "bf_ll", 0.0) or 0.0)
+            bf_rl = float(getattr(self.geometry, "bf_rl", 0.0) or 0.0)
+            bf_lower = max(bf_ll, bf_rl, 0.0)
+            flange_width_lower = Tw + 2.0 * bf_lower
+            y_outer = flange_width_lower / 2.0 - cover if bf_lower > 1e-6 else (Tw / 2.0 - cover)
             y_inner = Tw / 2 - cover
             z_full_bottom = cover
             z_flange_top_left = max(cover, float(tf_lower) - cover)
@@ -814,6 +1153,12 @@ class RebarEngine:
 
         # 3. 洞顶/洞底小梁箍筋（沿 X 方向 @spacing，补齐洞口两端）
         if hole.small_beam_stirrup_spacing > 0 and hole.small_beam_stirrup_diameter > 0:
+            try:
+                sb_legs = int(getattr(hole, "small_beam_stirrup_legs", 0) or 0)
+            except Exception:
+                sb_legs = 0
+            if sb_legs <= 0:
+                sb_legs = 4
             sb_nodes, sb_elems_top, sb_elems_bot = self._create_hole_small_beam_stirrups(
                 x_left=x_left,
                 x_right=x_right,
@@ -824,6 +1169,7 @@ class RebarEngine:
                 diameter=float(hole.small_beam_stirrup_diameter),
                 cover=cover,
                 H=float(H),
+                legs=int(sb_legs),
                 edge_clear=edge_clear
             )
             all_nodes.extend(sb_nodes)
@@ -850,6 +1196,7 @@ class RebarEngine:
                                         diameter: float,
                                         cover: float,
                                         H: float,
+                                        legs: int = 4,
                                         edge_clear: float = 0.0) -> Tuple[List, List, List]:
         """
         洞顶/洞底小梁箍筋（D@spacing）：在洞口范围内生成若干道矩形箍筋（YZ平面闭合环），并确保包含洞口两端。
@@ -882,97 +1229,115 @@ class RebarEngine:
         x_positions.extend([float(x0), float(x1)])
         x_positions = sorted(set(round(v, 6) for v in x_positions))
 
-        # 洞顶/洞底“小梁箍筋”采用 ring13（工字型闭合），但严格限制在局部高度带内：
-        # - 顶部带：完全位于洞顶之上（z >= z_top + cover）
-        # - 底部带：完全位于洞底之下（z <= z_bottom - cover）
-        #
-        # ring13 需要 y_outer/y_inner。洞顶位置在腹板区时，外肢不能跑到翼缘宽度外，
-        # 这里按“所在截面区域”自适应：
-        # - 若带宽位于下翼缘厚度范围内：外肢取翼缘外侧（更符合“外箍筋”要求）
-        # - 否则：外肢收敛到腹板附近（避免钢筋跑出混凝土）
-        band = 80.0  # mm：固定带宽，便于验收/自检
-        bf = max(
-            float(getattr(self.geometry, "bf_ll", 0.0) or 0.0),
-            float(getattr(self.geometry, "bf_rl", 0.0) or 0.0),
-            float(getattr(self.geometry, "bf_lu", 0.0) or 0.0),
-            float(getattr(self.geometry, "bf_ru", 0.0) or 0.0),
-        )
-        flange_width = float(self.geometry.Tw) + 2.0 * bf
-        y_inner = float(self.geometry.Tw) / 2.0 - float(cover)
-        y_outer_full = flange_width / 2.0 - float(cover)
+        # 洞顶/洞底“小梁箍筋”：
+        # - 作为洞口上下两个“独立小梁”的箍筋笼，禁止任何钢筋线段穿过洞口真空区
+        # - 顶部带：洞顶 + cover -> 梁顶 - cover
+        # - 底部带：梁底 + cover -> 洞底 - cover（贯通到梁底，并包住下翼缘混凝土）
+        try:
+            legs_req = int(legs)
+        except Exception:
+            legs_req = 4
+        legs_eff = max(2, legs_req)
 
-        top_z1 = float(z_top) + float(cover)
-        top_z2 = top_z1 + band
-        top_z1 = max(float(cover), top_z1)
-        top_z2 = min(float(H) - float(cover), top_z2)
-        if top_z2 <= top_z1 + 1e-6:
-            top_z2 = top_z1 + 1.0
+        y_web = float(self.geometry.Tw) / 2.0 - float(cover)
+        # 底部带外包宽度：若存在下翼缘，外包到下翼缘外侧；否则外包到腹板
+        bf_ll = float(getattr(self.geometry, "bf_ll", 0.0) or 0.0)
+        bf_rl = float(getattr(self.geometry, "bf_rl", 0.0) or 0.0)
+        bf_lower = max(bf_ll, bf_rl, 0.0)
+        y_outer_bot = (float(self.geometry.Tw) + 2.0 * float(bf_lower)) / 2.0 - float(cover) if bf_lower > 1e-6 else float(y_web)
 
-        bot_z2 = float(z_bottom) - float(cover)
-        bot_z1 = bot_z2 - band
-        bot_z1 = max(float(cover), bot_z1)
-        bot_z2 = min(float(H) - float(cover), bot_z2)
-        if bot_z2 <= bot_z1 + 1e-6:
-            bot_z2 = bot_z1 + 1.0
+        top_z2 = float(H) - float(cover)
+        top_z1_raw = float(z_top) + float(cover)
+        top_z1 = max(float(cover), min(top_z1_raw, top_z2))
+        top_enabled = (top_z2 > top_z1 + 1e-6)
 
-        def _ring13_at(xv: float, z1: float, z2: float) -> Tuple[List, List]:
-            # 用 band 中点判定是否处于下翼缘范围：下翼缘厚度取 geometry.tf_ll/tf_rl 的最大
-            tf_lower = max(float(getattr(self.geometry, "tf_ll", 0.0) or 0.0),
-                           float(getattr(self.geometry, "tf_rl", 0.0) or 0.0))
-            zmid_band = 0.5 * (float(z1) + float(z2))
-            if zmid_band <= (tf_lower - float(cover) + 1e-6):
-                y_outer = y_outer_full
-            else:
-                # 腹板区：外肢靠近腹板，避免跑出混凝土；留 1mm 防止退化为零长度
-                y_outer = max(y_inner + 1.0, y_inner)
+        bot_z1 = float(cover)
+        bot_z2_raw = float(z_bottom) - float(cover)
+        bot_z2 = max(bot_z1 + 1.0, min(float(H) - float(cover), bot_z2_raw))
+        bot_enabled = (bot_z2 > bot_z1 + 1e-6)
 
-            # ring13 的“翼缘顶”在局部带内取中点，确保外肢为短肢、内肢贯通带宽
-            z_fl = 0.5 * (float(z1) + float(z2))
+        def _y_positions_for_top() -> List[float]:
+            if legs_eff <= 2 or y_web <= 1e-6:
+                return [-y_web, y_web]
+            k = legs_eff - 2
+            step = (2.0 * y_web) / float(k + 1)
+            mids = [(-y_web + float(i) * step) for i in range(1, k + 1)]
+            return [float(-y_web)] + [float(round(v, 6)) for v in mids] + [float(y_web)]
 
-            # === 创建10个关键节点（与全局 ring13 拓扑一致）===
-            n1 = Node(xv, -y_outer, z1)
-            n2 = Node(xv, -y_inner, z1)
-            n3 = Node(xv,  y_inner, z1)
-            n4 = Node(xv,  y_outer, z1)
-            n5 = Node(xv, -y_outer, z_fl)
-            n6 = Node(xv,  y_outer, z_fl)
-            n7 = Node(xv, -y_inner, z_fl)
-            n8 = Node(xv,  y_inner, z_fl)
-            n9 = Node(xv, -y_inner, z2)
-            n10= Node(xv,  y_inner, z2)
-            _nodes = [n1,n2,n3,n4,n5,n6,n7,n8,n9,n10]
+        def _y_positions_for_bottom() -> List[float]:
+            # 无下翼缘或要求<=2肢：外包到 y_outer_bot（此时 y_outer_bot==y_web 或退化）
+            if legs_eff <= 2 or y_outer_bot <= 1e-6:
+                return [-y_outer_bot, y_outer_bot]
+            k = legs_eff - 2
+            step = (2.0 * y_outer_bot) / float(k + 1)
+            mids = [(-y_outer_bot + float(i) * step) for i in range(1, k + 1)]
+            return [float(-y_outer_bot)] + [float(round(v, 6)) for v in mids] + [float(y_outer_bot)]
 
-            # === 13 段闭合（与全局 ring13 一致）===
-            _elems = [
-                Element([n1.id, n2.id], etype=EleType.Link),
-                Element([n2.id, n3.id], etype=EleType.Link),
-                Element([n3.id, n4.id], etype=EleType.Link),
-                Element([n1.id, n5.id], etype=EleType.Link),
-                Element([n4.id, n6.id], etype=EleType.Link),
-                Element([n2.id, n7.id], etype=EleType.Link),
-                Element([n3.id, n8.id], etype=EleType.Link),
-                Element([n5.id, n7.id], etype=EleType.Link),
-                Element([n8.id, n6.id], etype=EleType.Link),
-                Element([n7.id, n9.id], etype=EleType.Link),
-                Element([n8.id, n10.id], etype=EleType.Link),
-                Element([n9.id, n10.id], etype=EleType.Link),
-                Element([n7.id, n8.id], etype=EleType.Link),  # 封口横筋
-            ]
+        def _y_positions_inner_web(nlegs: int) -> List[float]:
+            nlegs = max(2, int(nlegs))
+            if nlegs <= 2 or y_web <= 1e-6:
+                return [-y_web, y_web]
+            k = nlegs - 2
+            step = (2.0 * y_web) / float(k + 1)
+            mids = [(-y_web + float(i) * step) for i in range(1, k + 1)]
+            return [float(-y_web)] + [float(round(v, 6)) for v in mids] + [float(y_web)]
+
+        def _multi_leg_ring_at(xv: float, z1: float, z2: float, y_positions: List[float]) -> Tuple[List, List]:
+            ys = [float(v) for v in (y_positions or [])]
+            ys = sorted(set(round(v, 6) for v in ys))
+            if len(ys) < 2:
+                ys = [-y_web, y_web]
+
+            nb = [Node(xv, float(yv), float(z1)) for yv in ys]
+            nt = [Node(xv, float(yv), float(z2)) for yv in ys]
+            _nodes = nb + nt
+            _elems: List = []
+
+            # 底部横向：分段连接，内部节点用于“内肢落点”
+            for i in range(len(nb) - 1):
+                _elems.append(Element([nb[i].id, nb[i + 1].id], etype=EleType.Link))
+            # 顶部横向：分段连接
+            for i in range(len(nt) - 1):
+                _elems.append(Element([nt[i].id, nt[i + 1].id], etype=EleType.Link))
+            # 竖向肢：每个 y 一个竖向单元
+            for i in range(len(nb)):
+                _elems.append(Element([nb[i].id, nt[i].id], etype=EleType.Link))
+
+            self._tag_elements_diameter(_elems, diameter)
             return _nodes, _elems
 
         for xv in x_positions:
-            # 顶部带 ring13
-            ns, es = _ring13_at(float(xv), float(top_z1), float(top_z2))
-            nodes.extend(ns); elems_top.extend(es)
-            # 底部带 ring13
-            ns, es = _ring13_at(float(xv), float(bot_z1), float(bot_z2))
-            nodes.extend(ns); elems_bot.extend(es)
+            # 顶部带（无空间则跳过）
+            if top_enabled:
+                ns, es = _multi_leg_ring_at(float(xv), float(top_z1), float(top_z2), _y_positions_for_top())
+                nodes.extend(ns); elems_top.extend(es)
+            # 底部带
+            if bot_enabled:
+                # 关键：下翼缘外肢（±y_outer_bot）仅应出现在下翼缘高度范围内；
+                # 若直接把外肢贯通到 bot_z2（通常 > tf_lower-cover），会在“上部腹板窄区”越出混凝土，触发 PKPM: rebar.within_concrete.y_by_z。
+                tf_ll = float(getattr(self.geometry, "tf_ll", 0.0) or 0.0)
+                tf_rl = float(getattr(self.geometry, "tf_rl", 0.0) or 0.0)
+                tf_lower = max(tf_ll, tf_rl, 0.0)
+                z_step = max(float(bot_z1) + 1.0, min(float(bot_z2), float(tf_lower) - float(cover))) if tf_lower > 1e-6 else float(bot_z1)
+
+                stepped = (y_outer_bot > y_web + 1e-6) and (legs_eff >= 4) and (z_step > float(bot_z1) + 1e-6) and (z_step < float(bot_z2) - 1e-6)
+                if stepped:
+                    # “总肢数(含外肢)”口径：外肢 2 根（仅在下翼缘范围），其余肢为腹板内肢（贯通到 bot_z2）
+                    inner_legs = max(2, int(legs_eff) - 2)
+                    ns1, es1 = _multi_leg_ring_at(float(xv), float(bot_z1), float(bot_z2), _y_positions_inner_web(inner_legs))
+                    ns2, es2 = _multi_leg_ring_at(float(xv), float(bot_z1), float(z_step), [-float(y_outer_bot), float(y_outer_bot)])
+                    nodes.extend(ns1 + ns2)
+                    elems_bot.extend(es1 + es2)
+                else:
+                    ns, es = _multi_leg_ring_at(float(xv), float(bot_z1), float(bot_z2), _y_positions_for_bottom())
+                    nodes.extend(ns); elems_bot.extend(es)
 
         return nodes, elems_top, elems_bot
 
     def _create_hole_longitudinal_rebars(self, x_start: float, x_end: float,
                                           z: float, y_width: float, count: int,
-                                          diameter: float, cover: float) -> Dict:
+                                          diameter: float, cover: float,
+                                          holes: List[HoleParams] = None) -> Dict:
         """
         创建洞口顶/底的水平补强纵筋
 
@@ -987,28 +1352,19 @@ class RebarEngine:
         Returns:
             {'nodes': [], 'elements': []}
         """
-        nodes = []
-        elements = []
-
         # 计算Y方向位置
         y_positions = self._calculate_rebar_y_positions(y_width, count, cover)
 
-        # 为每根钢筋创建节点和单元
-        num_segments = 10  # 分段数
-        x_points = [x_start + i * (x_end - x_start) / num_segments for i in range(num_segments + 1)]
-
-        for y in y_positions:
-            rebar_nodes = []
-            for x in x_points:
-                node = Node(x, y, z)
-                nodes.append(node)
-                rebar_nodes.append(node)
-
-            # 创建Link单元
-            for i in range(len(rebar_nodes) - 1):
-                elem = Element([rebar_nodes[i].id, rebar_nodes[i+1].id], etype=EleType.Link)
-                elements.append(elem)
-
+        # 复用通用纵筋生成（含洞口真空区避让）
+        nodes, elements = self._create_rebar_line(
+            x_start=float(x_start),
+            x_end=float(x_end),
+            z=float(z),
+            y_positions=[float(v) for v in (y_positions or [])],
+            diameter=float(diameter),
+            num_segments=10,
+            holes=holes
+        )
         return {'nodes': nodes, 'elements': elements}
 
     def _create_hole_side_i_stirrups(self, x_start: float, x_end: float,
@@ -1093,6 +1449,7 @@ class RebarEngine:
             e3 = Element([n3.id, n4.id], etype=EleType.Link)  # 顶边
             e4 = Element([n4.id, n1.id], etype=EleType.Link)  # 左边
             elements.extend([e1, e2, e3, e4])
+            self._tag_elements_diameter([e1, e2, e3, e4], diameter)
 
             # 多肢箍筋：添加中间拉筋
             if legs >= 4:
@@ -1104,6 +1461,10 @@ class RebarEngine:
                     n_top = Node(x, y_mid, z_top - cover)
                     nodes.extend([n_bot, n_top])
                     e_mid = Element([n_bot.id, n_top.id], etype=EleType.Link)
+                    try:
+                        e_mid.diameter = float(diameter)
+                    except Exception:
+                        pass
                     elements.append(e_mid)
 
         return {'nodes': nodes, 'elements': elements}

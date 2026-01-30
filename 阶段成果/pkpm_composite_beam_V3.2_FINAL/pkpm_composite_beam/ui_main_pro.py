@@ -1,30 +1,70 @@
 """
 PKPM-CAE 叠合梁参数化建模引擎 - PyQt5 专业版UI
-T+7 优化版 - 印刷级界面质量
 """
 
 import sys
 import os
+import traceback
 from pathlib import Path
-import openpyxl
-from openpyxl import Workbook
-from PyQt5.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QTabWidget, QLabel, QLineEdit, QPushButton, QFileDialog,
-    QGroupBox, QFormLayout, QTextEdit, QMessageBox, QScrollArea,
-    QDoubleSpinBox, QSpinBox, QComboBox, QFrame
-)
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QSize
-from PyQt5.QtGui import QFont, QIcon, QPalette, QColor, QPixmap, QPainter
+
+
+def _write_ui_error_log(exc: BaseException) -> None:
+    try:
+        base_dir = Path(__file__).resolve().parent
+    except Exception:
+        base_dir = Path.cwd()
+    log_path = base_dir / "ui_error.log"
+    try:
+        log_path.write_text(
+            "UI 启动/运行异常：\n\n" + "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)),
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
+
+
+def _show_startup_error(msg: str) -> None:
+    try:
+        if os.name == "nt":
+            import ctypes  # noqa: PLC0415
+            ctypes.windll.user32.MessageBoxW(None, msg, "PKPM-CAE Composite Beam Tool", 0x10)
+            return
+    except Exception:
+        pass
+    try:
+        print(msg)
+    except Exception:
+        pass
+
+
+try:
+    from PyQt5.QtWidgets import (
+        QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+        QTabWidget, QLabel, QLineEdit, QPushButton, QFileDialog,
+        QGroupBox, QFormLayout, QTextEdit, QMessageBox, QScrollArea,
+        QDoubleSpinBox, QSpinBox, QComboBox, QFrame
+    )
+    from PyQt5.QtCore import Qt, QThread, pyqtSignal, QSize
+    from PyQt5.QtGui import QFont, QIcon, QPalette, QColor, QPixmap, QPainter
+except Exception as e:
+    _write_ui_error_log(e)
+    _show_startup_error(
+        "无法启动 UI：缺少 PyQt5 依赖。\n\n"
+        "解决办法：\n"
+        "1) 先运行“安装依赖.bat”\n"
+        "2) 或确保 Python 环境已安装 PyQt5\n\n"
+        "已生成错误日志：ui_error.log"
+    )
+    raise SystemExit(1)
 
 # 核心路径修复逻辑
 def get_resource_path(relative_path):
     """获取程序运行时资源的绝对路径（兼容源码和EXE打包）"""
     if hasattr(sys, '_MEIPASS'):
-        # EXE 运行时，指向临时目录
-        return os.path.join(sys._MEIPASS, relative_path)
-    # 源码运行时，指向当前目录
-    return os.path.join(os.path.abspath("."), relative_path)
+        base_dir = sys._MEIPASS
+    else:
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base_dir, relative_path)
 
 # 修改所有涉及路径的地方
 current_dir = get_resource_path("")
@@ -36,6 +76,17 @@ try:
 except Exception as e:
     print(f"警告: 主引擎模块未加载 - {e}")
     ENGINE_AVAILABLE = False
+
+
+def _excepthook(exc_type, exc, tb):
+    _write_ui_error_log(exc)
+    try:
+        traceback.print_exception(exc_type, exc, tb)
+    except Exception:
+        pass
+
+
+sys.excepthook = _excepthook
 
 
 class ModelGenerationThread(QThread):
@@ -62,7 +113,8 @@ class ModelGenerationThread(QThread):
             self.progress.emit("[3/7] 创建钢筋布置...")
             generator.create_rebars()
 
-            self.progress.emit("[4/7] 配置钢筋嵌入...")
+            # 说明：部分 PKPM-CAE 版本要求网格后才能建立嵌入关系；生成脚本会输出对应操作指南
+            self.progress.emit("[4/7] 生成钢筋嵌入提示(网格后在CAE内完成)...")
             generator.create_embedment()
 
             self.progress.emit("[5/7] 创建预应力孔道...")
@@ -72,13 +124,24 @@ class ModelGenerationThread(QThread):
             generator.create_two_stage_analysis()
 
             self.progress.emit("[7/7] 导出 Python 脚本...")
-            generator.export_script(self.output_script)
+            # 输出路径策略：
+            # - 源码运行：固定输出到程序目录，便于统一交付/定位
+            # - EXE 运行：输出到 Excel 同目录（避免写入临时目录导致用户找不到输出文件）
+            output_path = self.output_script or "pkpm_composite_beam_model.py"
+            if not os.path.isabs(output_path):
+                base = os.path.basename(output_path)
+                if hasattr(sys, "_MEIPASS"):
+                    excel_dir = os.path.dirname(os.path.abspath(self.excel_path))
+                    output_path = os.path.join(excel_dir, base)
+                else:
+                    output_path = os.path.join(current_dir, base)
+            generator.export_script(output_path)
 
-            self.finished.emit(True, f"✅ 模型生成成功！\n输出文件: {self.output_script}")
+            self.finished.emit(True, f"模型生成成功！\n输出文件: {output_path}")
         except Exception as e:
             import traceback
             error_detail = traceback.format_exc()
-            self.finished.emit(False, f"❌ 错误: {str(e)}\n\n详细信息:\n{error_detail}")
+            self.finished.emit(False, f"错误: {str(e)}\n\n详细信息:\n{error_detail}")
 
 
 class CompositeBeamUI(QMainWindow):
@@ -87,6 +150,8 @@ class CompositeBeamUI(QMainWindow):
     def __init__(self):
         super().__init__()
         self.excel_path = None
+        self._temp_excel_to_cleanup = None
+        self._loading_excel = False
         self.init_ui()
         self.load_demo_parameters()  # 自动加载演示参数
 
@@ -99,7 +164,7 @@ class CompositeBeamUI(QMainWindow):
 
     def init_ui(self):
         """初始化专业级UI界面"""
-        self.setWindowTitle("PKPM-CAE 叠合梁参数化建模引擎 v1.0 (T+7)")
+        self.setWindowTitle("PKPM-CAE 叠合梁参数化建模工具 V3.2")
         self.setGeometry(100, 100, 1200, 850)
 
         # 设置全局默认中文字体
@@ -505,24 +570,23 @@ class CompositeBeamUI(QMainWindow):
     def _on_section_type_changed(self, index):
         """截面类型切换时更新翼缘参数的启用状态"""
         # index: 0=矩形, 1=T型, 2=倒T型, 3=工字型
+        loading = bool(getattr(self, "_loading_excel", False))
 
         # 上翼缘参数列表
         upper_params = ['bf_lu', 'tf_lu', 'bf_ru', 'tf_ru']
         # 下翼缘参数列表
         lower_params = ['bf_ll', 'tf_ll', 'bf_rl', 'tf_rl']
-        # 叠合面切分：现浇顶盖厚度仅在有上翼缘时有效
-        has_upper_flange = index in (1, 3)
+        # 现浇顶盖厚度：对所有截面类型都有效（0=自动）
         if "t_cast_cap" in self.geom_inputs:
-            self.geom_inputs["t_cast_cap"].setEnabled(has_upper_flange)
-            if not has_upper_flange:
-                self.geom_inputs["t_cast_cap"].setValue(0.0)
+            self.geom_inputs["t_cast_cap"].setEnabled(True)
 
         if index == 0:  # 矩形截面
             # 禁用所有翼缘，设为0
             self.upper_flange_group.setEnabled(False)
             self.lower_flange_group.setEnabled(False)
-            for p in upper_params + lower_params:
-                self.geom_inputs[p].setValue(0)
+            if not loading:
+                for p in upper_params + lower_params:
+                    self.geom_inputs[p].setValue(0)
             self.upper_flange_group.setTitle("上翼缘参数 (矩形截面不需要)")
             self.lower_flange_group.setTitle("下翼缘参数 (矩形截面不需要)")
 
@@ -530,11 +594,12 @@ class CompositeBeamUI(QMainWindow):
             # 启用上翼缘，禁用下翼缘
             self.upper_flange_group.setEnabled(True)
             self.lower_flange_group.setEnabled(False)
-            for p in upper_params:
-                if self.geom_inputs[p].value() == 0:
-                    self.geom_inputs[p].setValue(100.0 if 'bf' in p else 150.0)
-            for p in lower_params:
-                self.geom_inputs[p].setValue(0)
+            if not loading:
+                for p in upper_params:
+                    if self.geom_inputs[p].value() == 0:
+                        self.geom_inputs[p].setValue(100.0 if 'bf' in p else 150.0)
+                for p in lower_params:
+                    self.geom_inputs[p].setValue(0)
             self.upper_flange_group.setTitle("上翼缘参数 ✓")
             self.lower_flange_group.setTitle("下翼缘参数 (T型截面不需要)")
 
@@ -542,11 +607,12 @@ class CompositeBeamUI(QMainWindow):
             # 禁用上翼缘，启用下翼缘
             self.upper_flange_group.setEnabled(False)
             self.lower_flange_group.setEnabled(True)
-            for p in upper_params:
-                self.geom_inputs[p].setValue(0)
-            for p in lower_params:
-                if self.geom_inputs[p].value() == 0:
-                    self.geom_inputs[p].setValue(100.0 if 'bf' in p else 150.0)
+            if not loading:
+                for p in upper_params:
+                    self.geom_inputs[p].setValue(0)
+                for p in lower_params:
+                    if self.geom_inputs[p].value() == 0:
+                        self.geom_inputs[p].setValue(100.0 if 'bf' in p else 150.0)
             self.upper_flange_group.setTitle("上翼缘参数 (倒T型截面不需要)")
             self.lower_flange_group.setTitle("下翼缘参数 ✓")
 
@@ -554,9 +620,10 @@ class CompositeBeamUI(QMainWindow):
             # 启用所有翼缘
             self.upper_flange_group.setEnabled(True)
             self.lower_flange_group.setEnabled(True)
-            for p in upper_params + lower_params:
-                if self.geom_inputs[p].value() == 0:
-                    self.geom_inputs[p].setValue(100.0 if 'bf' in p else 150.0)
+            if not loading:
+                for p in upper_params + lower_params:
+                    if self.geom_inputs[p].value() == 0:
+                        self.geom_inputs[p].setValue(100.0 if 'bf' in p else 150.0)
             self.upper_flange_group.setTitle("上翼缘参数 ✓")
             self.lower_flange_group.setTitle("下翼缘参数 ✓")
 
@@ -572,8 +639,8 @@ class CompositeBeamUI(QMainWindow):
 
         self.rebar_inputs = {}
 
-        # 顶部钢筋组
-        top_group = QGroupBox("顶部纵向钢筋")
+        # 顶部钢筋组（通长筋）
+        top_group = QGroupBox("顶部通长筋（全跨）")
         top_layout = QFormLayout()
         top_group.setLayout(top_layout)
 
@@ -582,11 +649,18 @@ class CompositeBeamUI(QMainWindow):
             ("top_num", "钢筋根数", 4, "根"),
             ("top_spacing", "横向间距", 80, "mm"),
             ("top_cover", "保护层厚度", 40, "mm"),
+            ("top_rows", "纵筋排数(竖向)", 1, "排"),
+            ("top_row_spacing", "排间净距(竖向)", 40, "mm"),
         ]
 
         for field_name, label_text, default, unit in top_fields:
             input_widget = QSpinBox()
-            input_widget.setRange(0, 1000)
+            if field_name in ("top_rows",):
+                input_widget.setRange(1, 5)
+            elif field_name in ("top_row_spacing",):
+                input_widget.setRange(0, 300)
+            else:
+                input_widget.setRange(0, 1000)
             input_widget.setValue(default)
             input_widget.setSuffix(f" {unit}")
             input_widget.setMinimumWidth(150)
@@ -600,6 +674,39 @@ class CompositeBeamUI(QMainWindow):
 
         main_layout.addWidget(top_group)
 
+        # 支座附加筋组（左右可不同）
+        support_group = QGroupBox("支座附加筋（左右可不同）")
+        support_layout = QFormLayout()
+        support_group.setLayout(support_layout)
+
+        support_fields = [
+            ("left_support_top_dia", "左支座附加筋直径", 0, "mm"),
+            ("left_support_top_num", "左支座附加筋根数", 0, "根"),
+            ("left_support_length", "左支座区长度", 500, "mm"),
+            ("right_support_top_dia", "右支座附加筋直径", 0, "mm"),
+            ("right_support_top_num", "右支座附加筋根数", 0, "根"),
+            ("right_support_length", "右支座区长度", 500, "mm"),
+        ]
+
+        for field_name, label_text, default, unit in support_fields:
+            input_widget = QSpinBox()
+            if field_name.endswith("_length"):
+                input_widget.setRange(0, 50000)
+            else:
+                input_widget.setRange(0, 1000)
+            input_widget.setValue(default)
+            input_widget.setSuffix(f" {unit}")
+            input_widget.setMinimumWidth(150)
+
+            label = QLabel(f"{label_text}:")
+            label.setFont(QFont("Microsoft YaHei", 10))
+            label.setStyleSheet("font-weight: bold; color: #374151;")
+
+            self.rebar_inputs[field_name] = input_widget
+            support_layout.addRow(label, input_widget)
+
+        main_layout.addWidget(support_group)
+
         # 底部钢筋组
         bottom_group = QGroupBox("底部纵向钢筋")
         bottom_layout = QFormLayout()
@@ -610,11 +717,18 @@ class CompositeBeamUI(QMainWindow):
             ("bottom_num", "钢筋根数", 6, "根"),
             ("bottom_spacing", "横向间距", 70, "mm"),
             ("bottom_cover", "保护层厚度", 40, "mm"),
+            ("bottom_rows", "纵筋排数(竖向)", 1, "排"),
+            ("bottom_row_spacing", "排间净距(竖向)", 40, "mm"),
         ]
 
         for field_name, label_text, default, unit in bottom_fields:
             input_widget = QSpinBox()
-            input_widget.setRange(0, 1000)
+            if field_name in ("bottom_rows",):
+                input_widget.setRange(1, 5)
+            elif field_name in ("bottom_row_spacing",):
+                input_widget.setRange(0, 300)
+            else:
+                input_widget.setRange(0, 1000)
             input_widget.setValue(default)
             input_widget.setSuffix(f" {unit}")
             input_widget.setMinimumWidth(150)
@@ -687,118 +801,77 @@ class CompositeBeamUI(QMainWindow):
 
         self.hole_inputs = {}
 
-        # 洞口1组
-        hole1_group = QGroupBox("洞口 1")
-        hole1_layout = QFormLayout()
-        hole1_group.setLayout(hole1_layout)
+        note = self.create_label("说明：每个洞口都可独立配置补强参数；生成 Excel 时会逐洞口写入 Holes sheet（多行）。")
+        note.setStyleSheet("color: #059669; font-size: 11px; font-style: italic;")
+        note.setWordWrap(True)
+        main_layout.addWidget(note)
 
-        hole1_fields = [
-            ("hole1_x", "距左端距离", 2000, "mm"),
-            ("hole1_z", "距底部距离", 100, "mm"),
-            ("hole1_width", "洞口宽度", 800, "mm"),
-            ("hole1_height", "洞口高度", 300, "mm"),
-        ]
+        def _add_int(layout: QFormLayout, key: str, label_text: str, default: int, unit: str, vmin: int, vmax: int):
+            w = QSpinBox()
+            w.setRange(vmin, vmax)
+            w.setValue(int(default))
+            w.setSuffix(f" {unit}")
+            w.setMinimumWidth(150)
+            self.hole_inputs[key] = w
+            layout.addRow(self.create_label(f"{label_text}:"), w)
 
-        for field_name, label_text, default, unit in hole1_fields:
-            input_widget = QSpinBox()
-            input_widget.setRange(0, 20000)
-            input_widget.setValue(default)
-            input_widget.setSuffix(f" {unit}")
-            input_widget.setMinimumWidth(150)
+        def _add_float(layout: QFormLayout, key: str, label_text: str, default: float, unit: str, vmin: float, vmax: float, dec: int = 1):
+            w = QDoubleSpinBox()
+            w.setRange(float(vmin), float(vmax))
+            w.setValue(float(default))
+            w.setDecimals(int(dec))
+            w.setSuffix(f" {unit}")
+            w.setMinimumWidth(150)
+            self.hole_inputs[key] = w
+            layout.addRow(self.create_label(f"{label_text}:"), w)
 
-            label = QLabel(f"{label_text}:")
-            label.setFont(QFont("Microsoft YaHei", 10))  # 明确设置中文字体
-            label.setStyleSheet("font-weight: bold; color: #374151;")
+        def _create_one_hole(idx: int) -> QGroupBox:
+            title = f"洞口 {idx}" + ("" if idx == 1 else "（可选）")
+            group = QGroupBox(title)
+            layout = QFormLayout()
+            group.setLayout(layout)
 
-            self.hole_inputs[field_name] = input_widget
-            hole1_layout.addRow(label, input_widget)
+            if idx > 1:
+                enable = QComboBox()
+                enable.addItems(["禁用", "启用"])
+                enable.setCurrentText("禁用")
+                self.hole_inputs[f"hole{idx}_enabled"] = enable
+                layout.addRow(self.create_label(f"洞口{idx}启用:"), enable)
 
-        main_layout.addWidget(hole1_group)
+            _add_int(layout, f"hole{idx}_x", "距左端距离", 2000 if idx == 1 else 0, "mm", 0, 50000)
+            _add_int(layout, f"hole{idx}_z", "距底部距离", 100 if idx == 1 else 0, "mm", 0, 50000)
+            _add_int(layout, f"hole{idx}_width", "洞口宽度", 800 if idx == 1 else 0, "mm", 0, 50000)
+            _add_int(layout, f"hole{idx}_height", "洞口高度", 300 if idx == 1 else 0, "mm", 0, 50000)
 
-        # 小梁配筋组 (洞口上下的小梁)
-        small_beam_group = QGroupBox("小梁配筋 (洞口上下)")
-        small_beam_layout = QFormLayout()
-        small_beam_group.setLayout(small_beam_layout)
+            fillet_enable = QComboBox()
+            fillet_enable.addItems(["禁用", "启用"])
+            fillet_enable.setCurrentText("启用" if idx == 1 else "禁用")
+            self.hole_inputs[f"fillet{idx}_enabled"] = fillet_enable
+            layout.addRow(self.create_label("倒角启用:"), fillet_enable)
+            _add_float(layout, f"fillet{idx}_radius", "倒角半径", 50.0 if idx == 1 else 0.0, "mm", 0.0, 5000.0, dec=1)
 
-        small_beam_fields = [
-            ("smallbeam_long_dia", "纵筋直径", 16, "mm"),
-            ("smallbeam_long_count", "纵筋根数", 2, "根"),
-            ("smallbeam_stirrup_dia", "箍筋直径", 8, "mm"),
-            ("smallbeam_stirrup_spacing", "箍筋间距", 150, "mm"),
-        ]
+            layout.addRow(self.create_label("—— 洞口上下小梁配筋 ——"), QLabel(""))
+            _add_int(layout, f"hole{idx}_smallbeam_long_top_dia", "顶部纵筋直径", 16 if idx == 1 else 0, "mm", 0, 60)
+            _add_int(layout, f"hole{idx}_smallbeam_long_top_count", "顶部纵筋根数", 2 if idx == 1 else 0, "根", 0, 100)
+            _add_int(layout, f"hole{idx}_smallbeam_long_bottom_dia", "底部纵筋直径", 16 if idx == 1 else 0, "mm", 0, 60)
+            _add_int(layout, f"hole{idx}_smallbeam_long_bottom_count", "底部纵筋根数", 2 if idx == 1 else 0, "根", 0, 100)
+            _add_int(layout, f"hole{idx}_smallbeam_stirrup_dia", "小梁箍筋直径", 8 if idx == 1 else 0, "mm", 0, 60)
+            _add_int(layout, f"hole{idx}_smallbeam_stirrup_spacing", "小梁箍筋间距", 150 if idx == 1 else 0, "mm", 0, 50000)
+            _add_int(layout, f"hole{idx}_smallbeam_stirrup_legs", "小梁箍筋肢数(总肢)", 4 if idx == 1 else 0, "肢", 0, 12)
 
-        for field_name, label_text, default, unit in small_beam_fields:
-            input_widget = QSpinBox()
-            input_widget.setRange(0, 1000)
-            input_widget.setValue(default)
-            input_widget.setSuffix(f" {unit}")
-            input_widget.setMinimumWidth(150)
+            layout.addRow(self.create_label("—— 洞口侧边补强 ——"), QLabel(""))
+            _add_int(layout, f"hole{idx}_left_reinf_length", "左侧补强长度", 500 if idx == 1 else 0, "mm", 0, 50000)
+            _add_int(layout, f"hole{idx}_right_reinf_length", "右侧补强长度", 500 if idx == 1 else 0, "mm", 0, 50000)
+            _add_int(layout, f"hole{idx}_side_stirrup_spacing", "侧边箍筋间距", 100 if idx == 1 else 0, "mm", 0, 50000)
+            _add_int(layout, f"hole{idx}_side_stirrup_dia", "侧边箍筋直径", 10 if idx == 1 else 0, "mm", 0, 60)
+            _add_int(layout, f"hole{idx}_side_stirrup_legs", "侧边箍筋肢数", 2 if idx == 1 else 0, "肢", 0, 8)
+            _add_int(layout, f"hole{idx}_reinf_extend_length", "补强筋伸出长度", 300 if idx == 1 else 0, "mm", 0, 50000)
 
-            label = QLabel(f"{label_text}:")
-            label.setFont(QFont("Microsoft YaHei", 10))
-            label.setStyleSheet("color: #374151;")
+            return group
 
-            self.hole_inputs[field_name] = input_widget
-            small_beam_layout.addRow(label, input_widget)
+        for i in (1, 2, 3):
+            main_layout.addWidget(_create_one_hole(i))
 
-        main_layout.addWidget(small_beam_group)
-
-        # 侧边补强组
-        side_reinf_group = QGroupBox("侧边补强")
-        side_reinf_layout = QFormLayout()
-        side_reinf_group.setLayout(side_reinf_layout)
-
-        side_reinf_fields = [
-            ("left_reinf_length", "左侧补强长度", 500, "mm"),
-            ("right_reinf_length", "右侧补强长度", 500, "mm"),
-            ("side_stirrup_spacing", "侧边箍筋间距", 100, "mm"),
-            ("side_stirrup_dia", "侧边箍筋直径", 10, "mm"),
-            ("side_stirrup_legs", "侧边箍筋肢数", 2, "肢"),
-            ("reinf_extend_length", "补强筋伸出长度", 300, "mm"),
-        ]
-
-        for field_name, label_text, default, unit in side_reinf_fields:
-            input_widget = QSpinBox()
-            input_widget.setRange(0, 5000)
-            input_widget.setValue(default)
-            input_widget.setSuffix(f" {unit}")
-            input_widget.setMinimumWidth(150)
-
-            label = QLabel(f"{label_text}:")
-            label.setFont(QFont("Microsoft YaHei", 10))
-            label.setStyleSheet("color: #374151;")
-
-            self.hole_inputs[field_name] = input_widget
-            side_reinf_layout.addRow(label, input_widget)
-
-        main_layout.addWidget(side_reinf_group)
-
-        # 圆弧倒角组（T+7新功能）
-        fillet_group = QGroupBox("圆弧倒角设置 (T+7 新功能)")
-        fillet_layout = QFormLayout()
-        fillet_group.setLayout(fillet_layout)
-
-        fillet_enable = QComboBox()
-        fillet_enable.addItems(["禁用", "启用"])
-        fillet_enable.setCurrentText("启用")
-        self.hole_inputs["fillet_enabled"] = fillet_enable
-
-        fillet_radius = QDoubleSpinBox()
-        fillet_radius.setRange(0, 500)
-        fillet_radius.setValue(50.0)
-        fillet_radius.setDecimals(1)
-        fillet_radius.setSuffix(" mm")
-        fillet_radius.setMinimumWidth(150)
-        self.hole_inputs["fillet_radius"] = fillet_radius
-
-        fillet_layout.addRow(self.create_label("倒角启用:"), fillet_enable)
-        fillet_layout.addRow(self.create_label("倒角半径:"), fillet_radius)
-
-        info_label = self.create_label("说明: 对洞口四角进行圆弧倒角，使几何更贴近实际工程")
-        info_label.setStyleSheet("color: #6B7280; font-size: 11px; font-style: italic;")
-        fillet_layout.addRow(info_label)
-
-        main_layout.addWidget(fillet_group)
         main_layout.addStretch()
 
         self.tab_widget.addTab(scroll, "🔲 洞口 & 倒角")
@@ -815,8 +888,14 @@ class CompositeBeamUI(QMainWindow):
 
         self.load_inputs = {}
 
-        # 荷载配置组
-        load_group = QGroupBox("荷载配置")
+        # 说明：按客户要求，脚本不施加支座/荷载，仅预留对象
+        note = self.create_label("说明：脚本阶段不施加支座/荷载；仅预留加载对象（梁顶面、LOAD_LINE_1/LOAD_LINE_2、LOAD_POINTS）与支座集合（SUPPORT_*）。\n请在网格划分后在 PKPM-CAE 有限元分析模块内创建 Coupling/约束，并对面/线/点施加荷载。")
+        note.setStyleSheet("color: #059669; font-size: 11px; font-style: italic;")
+        note.setWordWrap(True)
+        main_layout.addWidget(note)
+
+        # 荷载配置组（仅记录，不用于脚本施加载荷）
+        load_group = QGroupBox("荷载配置（仅记录）")
         load_layout = QFormLayout()
         load_group.setLayout(load_layout)
 
@@ -839,11 +918,12 @@ class CompositeBeamUI(QMainWindow):
 
             self.load_inputs[field_name] = input_widget
             load_layout.addRow(label, input_widget)
+            input_widget.setEnabled(False)
 
         main_layout.addWidget(load_group)
 
-        # 边界条件组
-        boundary_group = QGroupBox("边界条件")
+        # 边界条件组（仅记录，不在脚本中创建 Coupling/约束）
+        boundary_group = QGroupBox("支座/边界（仅记录）")
         boundary_layout = QFormLayout()
         boundary_group.setLayout(boundary_layout)
 
@@ -851,22 +931,23 @@ class CompositeBeamUI(QMainWindow):
         boundary_combo.addItems(["一端固支一端简支 (推荐)", "两端简支", "两端固支"])
         boundary_combo.setCurrentIndex(0)
         self.load_inputs["boundary_condition"] = boundary_combo
+        boundary_combo.setEnabled(False)
 
         label = QLabel("支座类型:")
         label.setFont(QFont("Microsoft YaHei", 10))
         label.setStyleSheet("font-weight: bold; color: #374151;")
         boundary_layout.addRow(label, boundary_combo)
 
-        # 边界说明
-        info_label = self.create_label("说明: 左端为固定支座(Coupling刚性耦合), 右端为简支(线约束Dof.Uz)")
+        # 边界说明（与脚本工作流一致）
+        info_label = self.create_label("提示：请在网格后用 SUPPORT_REF_POINTS + SUPPORT_LEFT_FACE / SUPPORT_RIGHT_FACE / SUPPORT_RIGHT_BOTTOM_LINE 建立耦合与约束。")
         info_label.setStyleSheet("color: #059669; font-size: 11px; font-style: italic;")
         info_label.setWordWrap(True)
         boundary_layout.addRow(info_label)
 
         main_layout.addWidget(boundary_group)
 
-        # 荷载工况组
-        case_group = QGroupBox("荷载工况")
+        # 荷载工况组（仅记录）
+        case_group = QGroupBox("荷载工况（仅记录）")
         case_layout = QFormLayout()
         case_group.setLayout(case_layout)
 
@@ -874,6 +955,7 @@ class CompositeBeamUI(QMainWindow):
         case_combo.addItems(["标准组合", "准永久组合", "基本组合"])
         case_combo.setCurrentText("标准组合")
         self.load_inputs["load_case"] = case_combo
+        case_combo.setEnabled(False)
 
         label = QLabel("组合类型:")
         label.setFont(QFont("Microsoft YaHei", 10))
@@ -883,7 +965,7 @@ class CompositeBeamUI(QMainWindow):
         main_layout.addWidget(case_group)
         main_layout.addStretch()
 
-        self.tab_widget.addTab(scroll, "📊 荷载 & 边界")
+        self.tab_widget.addTab(scroll, "📌 后处理(荷载/支座)")
 
     def create_prestress_tab(self):
         """创建预应力标签页"""
@@ -964,21 +1046,6 @@ class CompositeBeamUI(QMainWindow):
             self.file_path_edit.setText(file_path)
             self.log_text.append(f">>> 已选择文件: {Path(file_path).name}")
 
-    # def load_excel(self):
-        """读取Excel文件"""
-        if not self.excel_path:
-            QMessageBox.warning(self, "警告", "请先选择 Excel 文件")
-            return
-
-        try:
-            self.log_text.append(f">>> 正在解析 Excel: {Path(self.excel_path).name}")
-            # 这里添加 Excel 读取逻辑
-            self.log_text.append(">>> Excel 解析完成，参数已加载到界面")
-            QMessageBox.information(self, "成功", "Excel 参数加载成功！")
-        except Exception as e:
-            self.log_text.append(f">>> 错误: {str(e)}")
-            QMessageBox.critical(self, "错误", f"Excel 读取失败:\n{str(e)}")
-
     def load_excel(self):
         """读取Excel文件并将数值同步到UI界面 """
         if not self.excel_path:
@@ -987,14 +1054,30 @@ class CompositeBeamUI(QMainWindow):
 
         try:
             self.log_text.append(f">>> 正在同步 Excel 数据: {Path(self.excel_path).name}...")
+            self._loading_excel = True
             
             # 调用现有的解析器获取参数对象
-            from main import ExcelParser
+            from parsers.excel_parser import ExcelParser
             parser = ExcelParser(self.excel_path)
             p = parser.parse()
 
             # 1. 同步几何参数 (Sheet: Geometry)
             g = p.geometry
+
+            # 截面类型推断并同步
+            # 规则：有上翼缘=>T；有下翼缘=>倒T；上下都有=>工字；都无=>矩形
+            eps = 1e-6
+            upper_on = (max(float(g.tf_lu), float(g.tf_ru), float(g.bf_lu), float(g.bf_ru)) > eps)
+            lower_on = (max(float(g.tf_ll), float(g.tf_rl), float(g.bf_ll), float(g.bf_rl)) > eps)
+            if upper_on and lower_on:
+                sec_idx = 3  # 工字型截面
+            elif upper_on:
+                sec_idx = 1  # T型截面
+            elif lower_on:
+                sec_idx = 2  # 倒T型截面
+            else:
+                sec_idx = 0  # 矩形截面
+
             self.geom_inputs['L'].setValue(g.L)
             self.geom_inputs['H'].setValue(g.H)
             self.geom_inputs['Tw'].setValue(g.Tw)
@@ -1009,15 +1092,58 @@ class CompositeBeamUI(QMainWindow):
             self.geom_inputs['tf_ll'].setValue(g.tf_ll)
             self.geom_inputs['bf_rl'].setValue(g.bf_rl)
             self.geom_inputs['tf_rl'].setValue(g.tf_rl)
+            # 截面类型：加载期间禁止触发 currentIndexChanged（避免覆盖刚同步的数值）
+            _sec_combo = self.geom_inputs.get("section_type", None)
+            if _sec_combo is not None:
+                try:
+                    _sec_combo.blockSignals(True)
+                    _sec_combo.setCurrentIndex(sec_idx)
+                finally:
+                    try:
+                        _sec_combo.blockSignals(False)
+                    except Exception:
+                        pass
 
-            # 2. 同步纵向配筋 (取典型值)
+            # 刷新启用状态/标题（loading 模式下不改数值）
+            self._on_section_type_changed(sec_idx)
+
+            # 2. 同步纵向配筋
             lr = p.long_rebar
-            if lr.left_support_top_A:
-                self.rebar_inputs['top_dia'].setValue(lr.left_support_top_A.diameter)
-                self.rebar_inputs['top_num'].setValue(lr.left_support_top_A.count)
+            # 顶部通长筋（全跨）
+            if getattr(lr, "mid_span_top", None):
+                self.rebar_inputs['top_dia'].setValue(int(lr.mid_span_top.diameter))
+                self.rebar_inputs['top_num'].setValue(int(lr.mid_span_top.count))
+            # 左右支座附加筋（可选）
+            if 'left_support_top_dia' in self.rebar_inputs:
+                self.rebar_inputs['left_support_top_dia'].setValue(int(getattr(getattr(lr, "left_support_top_A", None), "diameter", 0) or 0))
+            if 'left_support_top_num' in self.rebar_inputs:
+                self.rebar_inputs['left_support_top_num'].setValue(int(getattr(getattr(lr, "left_support_top_A", None), "count", 0) or 0))
+            if 'right_support_top_dia' in self.rebar_inputs:
+                self.rebar_inputs['right_support_top_dia'].setValue(int(getattr(getattr(lr, "right_support_top_A", None), "diameter", 0) or 0))
+            if 'right_support_top_num' in self.rebar_inputs:
+                self.rebar_inputs['right_support_top_num'].setValue(int(getattr(getattr(lr, "right_support_top_A", None), "count", 0) or 0))
+            # 支座区长度：0 表示默认 L/3，这里为了观感直接显示为 L/3
+            try:
+                L0 = float(getattr(g, "L", 0.0) or 0.0)
+            except Exception:
+                L0 = 0.0
+            ll = float(getattr(lr, "left_support_length", 0.0) or 0.0)
+            rl = float(getattr(lr, "right_support_length", 0.0) or 0.0)
+            if 'left_support_length' in self.rebar_inputs:
+                self.rebar_inputs['left_support_length'].setValue(int(ll if ll > 1e-6 else (L0 / 3.0 if L0 > 1e-6 else 0)))
+            if 'right_support_length' in self.rebar_inputs:
+                self.rebar_inputs['right_support_length'].setValue(int(rl if rl > 1e-6 else (L0 / 3.0 if L0 > 1e-6 else 0)))
             if lr.bottom_through_A:
                 self.rebar_inputs['bottom_dia'].setValue(lr.bottom_through_A.diameter)
                 self.rebar_inputs['bottom_num'].setValue(lr.bottom_through_A.count)
+            if 'top_rows' in self.rebar_inputs:
+                self.rebar_inputs['top_rows'].setValue(int(getattr(lr, "top_rows", 1) or 1))
+            if 'top_row_spacing' in self.rebar_inputs:
+                self.rebar_inputs['top_row_spacing'].setValue(int(float(getattr(lr, "top_row_spacing", 0.0) or 0.0)))
+            if 'bottom_rows' in self.rebar_inputs:
+                self.rebar_inputs['bottom_rows'].setValue(int(getattr(lr, "bottom_rows", 1) or 1))
+            if 'bottom_row_spacing' in self.rebar_inputs:
+                self.rebar_inputs['bottom_row_spacing'].setValue(int(float(getattr(lr, "bottom_row_spacing", 0.0) or 0.0)))
 
             # 3. 同步箍筋 (Sheet: Stirrups)
             st = p.stirrup
@@ -1026,16 +1152,78 @@ class CompositeBeamUI(QMainWindow):
             self.stirrup_inputs['stirrup_normal_spacing'].setValue(st.normal_spacing)
             self.stirrup_inputs['stirrup_dense_length'].setValue(st.dense_zone_length)
             self.stirrup_inputs['stirrup_legs'].setValue(st.dense_legs)
+            if 'stirrup_cover' in self.stirrup_inputs:
+                self.stirrup_inputs['stirrup_cover'].setValue(int(float(getattr(st, "cover", 25.0) or 25.0)))
 
-            # 4. 同步洞口数据 (仅取第一个洞口作为展示)
-            if p.holes:
-                h = p.holes[0]
-                self.hole_inputs['hole1_x'].setValue(h.x)
-                self.hole_inputs['hole1_z'].setValue(h.z)
-                self.hole_inputs['hole1_width'].setValue(h.width)
-                self.hole_inputs['hole1_height'].setValue(h.height)
-                self.hole_inputs['fillet_enabled'].setCurrentText("启用" if h.fillet_radius > 0 else "禁用")
-                self.hole_inputs['fillet_radius'].setValue(h.fillet_radius)
+            # 4. 同步洞口数据（最多同步到洞口1~3）
+            holes = list(p.holes or [])
+            if holes:
+                for idx in (1, 2, 3):
+                    if idx - 1 >= len(holes):
+                        if idx > 1 and f"hole{idx}_enabled" in self.hole_inputs:
+                            self.hole_inputs[f"hole{idx}_enabled"].setCurrentText("禁用")
+                        continue
+
+                    h = holes[idx - 1]
+                    if idx > 1 and f"hole{idx}_enabled" in self.hole_inputs:
+                        self.hole_inputs[f"hole{idx}_enabled"].setCurrentText("启用")
+
+                    self.hole_inputs[f'hole{idx}_x'].setValue(h.x)
+                    self.hole_inputs[f'hole{idx}_z'].setValue(h.z)
+                    self.hole_inputs[f'hole{idx}_width'].setValue(h.width)
+                    self.hole_inputs[f'hole{idx}_height'].setValue(h.height)
+
+                    if f'fillet{idx}_enabled' in self.hole_inputs:
+                        self.hole_inputs[f'fillet{idx}_enabled'].setCurrentText("启用" if float(h.fillet_radius or 0.0) > 1e-6 else "禁用")
+                    if f'fillet{idx}_radius' in self.hole_inputs:
+                        self.hole_inputs[f'fillet{idx}_radius'].setValue(float(h.fillet_radius or 0.0))
+
+                    # 小梁配筋（顶/底分开；若旧字段存在则回退）
+                    try:
+                        top_d = float(getattr(h, "small_beam_long_top_diameter", 0.0) or 0.0)
+                        top_c = int(getattr(h, "small_beam_long_top_count", 0) or 0)
+                        bot_d = float(getattr(h, "small_beam_long_bottom_diameter", 0.0) or 0.0)
+                        bot_c = int(getattr(h, "small_beam_long_bottom_count", 0) or 0)
+                        legacy_d = float(getattr(h, "small_beam_long_diameter", 0.0) or 0.0)
+                        legacy_c = int(getattr(h, "small_beam_long_count", 0) or 0)
+                        if top_c <= 0 or top_d <= 0:
+                            top_d, top_c = legacy_d, legacy_c
+                        if bot_c <= 0 or bot_d <= 0:
+                            bot_d, bot_c = legacy_d, legacy_c
+                        if f'hole{idx}_smallbeam_long_top_dia' in self.hole_inputs:
+                            self.hole_inputs[f'hole{idx}_smallbeam_long_top_dia'].setValue(int(top_d))
+                        if f'hole{idx}_smallbeam_long_top_count' in self.hole_inputs:
+                            self.hole_inputs[f'hole{idx}_smallbeam_long_top_count'].setValue(int(top_c))
+                        if f'hole{idx}_smallbeam_long_bottom_dia' in self.hole_inputs:
+                            self.hole_inputs[f'hole{idx}_smallbeam_long_bottom_dia'].setValue(int(bot_d))
+                        if f'hole{idx}_smallbeam_long_bottom_count' in self.hole_inputs:
+                            self.hole_inputs[f'hole{idx}_smallbeam_long_bottom_count'].setValue(int(bot_c))
+                    except Exception:
+                        pass
+
+                    if f'hole{idx}_smallbeam_stirrup_dia' in self.hole_inputs:
+                        self.hole_inputs[f'hole{idx}_smallbeam_stirrup_dia'].setValue(int(float(getattr(h, "small_beam_stirrup_diameter", 0.0) or 0.0)))
+                    if f'hole{idx}_smallbeam_stirrup_spacing' in self.hole_inputs:
+                        self.hole_inputs[f'hole{idx}_smallbeam_stirrup_spacing'].setValue(int(float(getattr(h, "small_beam_stirrup_spacing", 0.0) or 0.0)))
+                    if f'hole{idx}_smallbeam_stirrup_legs' in self.hole_inputs:
+                        self.hole_inputs[f'hole{idx}_smallbeam_stirrup_legs'].setValue(int(getattr(h, "small_beam_stirrup_legs", 0) or 0))
+
+                    # 侧边补强
+                    if f'hole{idx}_left_reinf_length' in self.hole_inputs:
+                        self.hole_inputs[f'hole{idx}_left_reinf_length'].setValue(int(float(getattr(h, "left_reinf_length", 0.0) or 0.0)))
+                    if f'hole{idx}_right_reinf_length' in self.hole_inputs:
+                        self.hole_inputs[f'hole{idx}_right_reinf_length'].setValue(int(float(getattr(h, "right_reinf_length", 0.0) or 0.0)))
+                    if f'hole{idx}_side_stirrup_spacing' in self.hole_inputs:
+                        self.hole_inputs[f'hole{idx}_side_stirrup_spacing'].setValue(int(float(getattr(h, "side_stirrup_spacing", 0.0) or 0.0)))
+                    if f'hole{idx}_side_stirrup_dia' in self.hole_inputs:
+                        self.hole_inputs[f'hole{idx}_side_stirrup_dia'].setValue(int(float(getattr(h, "side_stirrup_diameter", 0.0) or 0.0)))
+                    if f'hole{idx}_side_stirrup_legs' in self.hole_inputs:
+                        self.hole_inputs[f'hole{idx}_side_stirrup_legs'].setValue(int(getattr(h, "side_stirrup_legs", 0) or 0))
+                    if f'hole{idx}_reinf_extend_length' in self.hole_inputs:
+                        self.hole_inputs[f'hole{idx}_reinf_extend_length'].setValue(int(float(getattr(h, "reinf_extend_length", 0.0) or 0.0)))
+
+                if len(holes) > 3:
+                    self.log_text.append(f">>> ⚠ UI 当前最多展示 3 个洞口参数（Excel 共 {len(holes)} 个洞口）")
 
             # 5. 同步预应力 (Sheet: Prestress)
             if p.prestress:
@@ -1051,6 +1239,10 @@ class CompositeBeamUI(QMainWindow):
                 else:
                     self.prestress_inputs['method'].setCurrentText("后张法(post_tension)")
                 self.prestress_inputs['duct_diameter'].setValue(ps.duct_diameter)
+            else:
+                self.prestress_inputs['enabled'].setCurrentText("禁用")
+                self.prestress_inputs['force'].setValue(0.0)
+                self.prestress_inputs['duct_diameter'].setValue(0.0)
 
             self.log_text.append(">>> ✅ Excel 数值已成功同步至 UI 界面！")
             QMessageBox.information(self, "同步成功", "Excel 数据已完美加载到界面，您可以继续微调参数。")
@@ -1058,166 +1250,165 @@ class CompositeBeamUI(QMainWindow):
         except Exception as e:
             self.log_text.append(f">>> ❌ 同步失败: {str(e)}")
             QMessageBox.critical(self, "同步错误", f"Excel 数据与界面不匹配:\n{str(e)}")
+        finally:
+            self._loading_excel = False
 
 
     def _save_ui_params_to_excel(self, excel_path="temp_ui_params.xlsx"):
         """将UI参数保存为Excel文件（100%匹配excel_parser.py的V3.0格式）"""
-        wb = Workbook()
+        # 使用 stdlib-only minimal xlsx writer，避免依赖 openpyxl
+        from parsers.xlsx_minimal_writer import write_table_workbook
 
-        # ========== Sheet 1: Geometry ==========
-        ws_geom = wb.active
-        ws_geom.title = "Geometry"
-        ws_geom.append(["L", "H", "Tw", "bf_lu", "tf_lu", "bf_ru", "tf_ru",
-                        "bf_ll", "tf_ll", "bf_rl", "tf_rl", "h_pre", "t_cast_cap"])
-        ws_geom.append([
-            self.geom_inputs['L'].value(),
-            self.geom_inputs['H'].value(),
-            self.geom_inputs['Tw'].value(),
-            self.geom_inputs['bf_lu'].value(),
-            self.geom_inputs['tf_lu'].value(),
-            self.geom_inputs['bf_ru'].value(),
-            self.geom_inputs['tf_ru'].value(),
-            self.geom_inputs['bf_ll'].value(),
-            self.geom_inputs['tf_ll'].value(),
-            self.geom_inputs['bf_rl'].value(),
-            self.geom_inputs['tf_rl'].value(),
-            self.geom_inputs['h_pre'].value(),
-            self.geom_inputs['t_cast_cap'].value() if ('t_cast_cap' in self.geom_inputs) else 0.0
-        ])
+        geometry_rows = [{
+            "L": self.geom_inputs['L'].value(),
+            "H": self.geom_inputs['H'].value(),
+            "Tw": self.geom_inputs['Tw'].value(),
+            "bf_lu": self.geom_inputs['bf_lu'].value(),
+            "tf_lu": self.geom_inputs['tf_lu'].value(),
+            "bf_ru": self.geom_inputs['bf_ru'].value(),
+            "tf_ru": self.geom_inputs['tf_ru'].value(),
+            "bf_ll": self.geom_inputs['bf_ll'].value(),
+            "tf_ll": self.geom_inputs['tf_ll'].value(),
+            "bf_rl": self.geom_inputs['bf_rl'].value(),
+            "tf_rl": self.geom_inputs['tf_rl'].value(),
+            "h_pre": self.geom_inputs['h_pre'].value(),
+            "t_cast_cap": self.geom_inputs['t_cast_cap'].value() if ('t_cast_cap' in self.geom_inputs) else 0.0,
+        }]
 
-        # ========== Sheet 2: Longitudinal Rebar ==========
-        ws_rebar = wb.create_sheet("Longitudinal Rebar")
-        ws_rebar.append(["Position", "Diameter_A", "Count_A", "Diameter_B", "Count_B", "Extend_Length"])
-
-        # 从UI获取钢筋参数
         top_dia = self.rebar_inputs['top_dia'].value()
         top_num = self.rebar_inputs['top_num'].value()
+        left_support_dia = int(self.rebar_inputs.get('left_support_top_dia').value() if self.rebar_inputs.get('left_support_top_dia') else 0)
+        left_support_num = int(self.rebar_inputs.get('left_support_top_num').value() if self.rebar_inputs.get('left_support_top_num') else 0)
+        left_support_len = float(self.rebar_inputs.get('left_support_length').value() if self.rebar_inputs.get('left_support_length') else 0.0)
+        right_support_dia = int(self.rebar_inputs.get('right_support_top_dia').value() if self.rebar_inputs.get('right_support_top_dia') else 0)
+        right_support_num = int(self.rebar_inputs.get('right_support_top_num').value() if self.rebar_inputs.get('right_support_top_num') else 0)
+        right_support_len = float(self.rebar_inputs.get('right_support_length').value() if self.rebar_inputs.get('right_support_length') else 0.0)
         bottom_dia = self.rebar_inputs['bottom_dia'].value()
         bottom_num = self.rebar_inputs['bottom_num'].value()
+        top_rows = int(self.rebar_inputs.get('top_rows').value() if self.rebar_inputs.get('top_rows') else 1)
+        top_row_spacing = float(self.rebar_inputs.get('top_row_spacing').value() if self.rebar_inputs.get('top_row_spacing') else 0.0)
+        bottom_rows = int(self.rebar_inputs.get('bottom_rows').value() if self.rebar_inputs.get('bottom_rows') else 1)
+        bottom_row_spacing = float(self.rebar_inputs.get('bottom_row_spacing').value() if self.rebar_inputs.get('bottom_row_spacing') else 0.0)
+        rebar_rows = [
+            # 顶部通长筋（全跨）
+            {"Position": "Top Through", "Diameter_A": top_dia, "Count_A": top_num, "Diameter_B": 0, "Count_B": 0, "Extend_Length": 0},
+            # 支座附加筋（可选；Extend_Length 作为支座区长度）
+            {"Position": "Left Support Top", "Diameter_A": left_support_dia, "Count_A": left_support_num, "Diameter_B": 0, "Count_B": 0, "Extend_Length": left_support_len},
+            {"Position": "Right Support Top", "Diameter_A": right_support_dia, "Count_A": right_support_num, "Diameter_B": 0, "Count_B": 0, "Extend_Length": right_support_len},
+            # 底部通长筋
+            {"Position": "Bottom Through", "Diameter_A": bottom_dia, "Count_A": bottom_num, "Diameter_B": 0, "Count_B": 0, "Extend_Length": 0},
+        ]
 
-        # 生成4个位置的数据
-        ws_rebar.append(["Left Support Top", top_dia, top_num, 0, 0, 500])
-        ws_rebar.append(["Mid Span Top", 20, max(2, top_num // 2), 0, 0, 0])
-        ws_rebar.append(["Right Support Top", top_dia, top_num, 0, 0, 500])
-        ws_rebar.append(["Bottom Through", bottom_dia, bottom_num, 0, 0, 0])
-
-        # ========== Sheet 3: Stirrups ==========
-        ws_stirrup = wb.create_sheet("Stirrups")
-        ws_stirrup.append(["Zone", "Spacing", "Legs", "Diameter", "Length", "Cover"])
+        longitudinal_layout_rows = [
+            {"Group": "Top", "Rows": top_rows, "RowSpacing": top_row_spacing},
+            {"Group": "Bottom", "Rows": bottom_rows, "RowSpacing": bottom_row_spacing},
+        ]
 
         stirrup_dia = self.stirrup_inputs['stirrup_dia'].value()
         dense_spacing = self.stirrup_inputs['stirrup_dense_spacing'].value()
         normal_spacing = self.stirrup_inputs['stirrup_normal_spacing'].value()
         dense_length = self.stirrup_inputs['stirrup_dense_length'].value()
+        stirrup_rows = [
+            {"Zone": "Dense", "Spacing": dense_spacing, "Legs": 4, "Diameter": stirrup_dia, "Length": dense_length, "Cover": 25},
+            {"Zone": "Normal", "Spacing": normal_spacing, "Legs": 2, "Diameter": stirrup_dia, "Length": 0, "Cover": 25},
+        ]
 
-        ws_stirrup.append(["Dense", dense_spacing, 4, stirrup_dia, dense_length, 25])
-        ws_stirrup.append(["Normal", normal_spacing, 2, stirrup_dia, 0, 25])
+        def _hole_enabled(idx: int) -> bool:
+            if idx == 1:
+                return True
+            w = self.hole_inputs.get(f"hole{idx}_enabled")
+            if not w:
+                return False
+            return str(w.currentText()).strip() == "启用"
 
-        # ========== Sheet 4: Holes ==========
-        # 注意：Z坐标不是Y！X是纵向位置，Z是竖向位置
-        ws_holes = wb.create_sheet("Holes")
-        ws_holes.append([
-            "X", "Z", "Width", "Height", "Fillet_Radius",
-            "SmallBeam_Long_Diameter", "SmallBeam_Long_Count",
-            "SmallBeam_Stirrup_Diameter", "SmallBeam_Stirrup_Spacing",
-            "Left_Reinf_Length", "Right_Reinf_Length",
-            "Side_Stirrup_Spacing", "Side_Stirrup_Diameter", "Side_Stirrup_Legs",
-            "Reinf_Extend_Length"
-        ])
-        
-        # 获取UI中的洞口1数据
-        hx = self.hole_inputs['hole1_x'].value()
-        hz = self.hole_inputs['hole1_z'].value()
-        hw = self.hole_inputs['hole1_width'].value()
-        hh = self.hole_inputs['hole1_height'].value()
+        def _hole_fillet_radius(idx: int) -> float:
+            enable = self.hole_inputs.get(f"fillet{idx}_enabled")
+            radius = self.hole_inputs.get(f"fillet{idx}_radius")
+            if enable is None or radius is None:
+                return 0.0
+            if str(enable.currentText()).strip() != "启用":
+                return 0.0
+            return float(radius.value())
+        holes_rows = []
+        for idx in (1, 2, 3):
+            if not _hole_enabled(idx):
+                continue
+            hx = self.hole_inputs.get(f"hole{idx}_x").value()
+            hz = self.hole_inputs.get(f"hole{idx}_z").value()
+            hw = self.hole_inputs.get(f"hole{idx}_width").value()
+            hh = self.hole_inputs.get(f"hole{idx}_height").value()
+            if hw <= 0 or hh <= 0:
+                continue
+            sb_long_top_dia = int(self.hole_inputs.get(f"hole{idx}_smallbeam_long_top_dia").value() if self.hole_inputs.get(f"hole{idx}_smallbeam_long_top_dia") else 0)
+            sb_long_top_count = int(self.hole_inputs.get(f"hole{idx}_smallbeam_long_top_count").value() if self.hole_inputs.get(f"hole{idx}_smallbeam_long_top_count") else 0)
+            sb_long_bottom_dia = int(self.hole_inputs.get(f"hole{idx}_smallbeam_long_bottom_dia").value() if self.hole_inputs.get(f"hole{idx}_smallbeam_long_bottom_dia") else 0)
+            sb_long_bottom_count = int(self.hole_inputs.get(f"hole{idx}_smallbeam_long_bottom_count").value() if self.hole_inputs.get(f"hole{idx}_smallbeam_long_bottom_count") else 0)
+            sb_stirrup_dia = int(self.hole_inputs.get(f"hole{idx}_smallbeam_stirrup_dia").value() if self.hole_inputs.get(f"hole{idx}_smallbeam_stirrup_dia") else 0)
+            sb_stirrup_spacing = int(self.hole_inputs.get(f"hole{idx}_smallbeam_stirrup_spacing").value() if self.hole_inputs.get(f"hole{idx}_smallbeam_stirrup_spacing") else 0)
+            sb_stirrup_legs = int(self.hole_inputs.get(f"hole{idx}_smallbeam_stirrup_legs").value() if self.hole_inputs.get(f"hole{idx}_smallbeam_stirrup_legs") else 0)
+            left_reinf = int(self.hole_inputs.get(f"hole{idx}_left_reinf_length").value() if self.hole_inputs.get(f"hole{idx}_left_reinf_length") else 0)
+            right_reinf = int(self.hole_inputs.get(f"hole{idx}_right_reinf_length").value() if self.hole_inputs.get(f"hole{idx}_right_reinf_length") else 0)
+            side_spacing = int(self.hole_inputs.get(f"hole{idx}_side_stirrup_spacing").value() if self.hole_inputs.get(f"hole{idx}_side_stirrup_spacing") else 0)
+            side_dia = int(self.hole_inputs.get(f"hole{idx}_side_stirrup_dia").value() if self.hole_inputs.get(f"hole{idx}_side_stirrup_dia") else 0)
+            side_legs = int(self.hole_inputs.get(f"hole{idx}_side_stirrup_legs").value() if self.hole_inputs.get(f"hole{idx}_side_stirrup_legs") else 0)
+            reinf_extend = int(self.hole_inputs.get(f"hole{idx}_reinf_extend_length").value() if self.hole_inputs.get(f"hole{idx}_reinf_extend_length") else 0)
+            holes_rows.append({
+                "X": hx, "Z": hz, "Width": hw, "Height": hh, "Fillet_Radius": _hole_fillet_radius(idx),
+                # 兼容旧字段：不区分顶/底时，只能表达一套（这里写入顶部值）
+                "SmallBeam_Long_Diameter": sb_long_top_dia, "SmallBeam_Long_Count": sb_long_top_count,
+                "SmallBeam_Long_Top_Diameter": sb_long_top_dia, "SmallBeam_Long_Top_Count": sb_long_top_count,
+                "SmallBeam_Long_Bottom_Diameter": sb_long_bottom_dia, "SmallBeam_Long_Bottom_Count": sb_long_bottom_count,
+                "SmallBeam_Stirrup_Diameter": sb_stirrup_dia, "SmallBeam_Stirrup_Spacing": sb_stirrup_spacing,
+                "SmallBeam_Stirrup_Legs": sb_stirrup_legs,
+                "Left_Reinf_Length": left_reinf, "Right_Reinf_Length": right_reinf,
+                "Side_Stirrup_Spacing": side_spacing, "Side_Stirrup_Diameter": side_dia, "Side_Stirrup_Legs": side_legs,
+                "Reinf_Extend_Length": reinf_extend,
+            })
 
-        # 处理倒角逻辑
-        fr = 0.0
-        if self.hole_inputs['fillet_enabled'].currentText() == "启用":
-            fr = self.hole_inputs['fillet_radius'].value()
-
-        # 获取小梁配筋参数 (从UI读取)
-        sb_long_dia = self.hole_inputs.get('smallbeam_long_dia', None)
-        sb_long_dia = sb_long_dia.value() if sb_long_dia else 16
-        sb_long_count = self.hole_inputs.get('smallbeam_long_count', None)
-        sb_long_count = sb_long_count.value() if sb_long_count else 2
-        sb_stirrup_dia = self.hole_inputs.get('smallbeam_stirrup_dia', None)
-        sb_stirrup_dia = sb_stirrup_dia.value() if sb_stirrup_dia else 8
-        sb_stirrup_spacing = self.hole_inputs.get('smallbeam_stirrup_spacing', None)
-        sb_stirrup_spacing = sb_stirrup_spacing.value() if sb_stirrup_spacing else 150
-
-        # 获取侧边补强参数 (从UI读取)
-        left_reinf = self.hole_inputs.get('left_reinf_length', None)
-        left_reinf = left_reinf.value() if left_reinf else 500
-        right_reinf = self.hole_inputs.get('right_reinf_length', None)
-        right_reinf = right_reinf.value() if right_reinf else 500
-        side_spacing = self.hole_inputs.get('side_stirrup_spacing', None)
-        side_spacing = side_spacing.value() if side_spacing else 100
-        side_dia = self.hole_inputs.get('side_stirrup_dia', None)
-        side_dia = side_dia.value() if side_dia else 10
-        side_legs = self.hole_inputs.get('side_stirrup_legs', None)
-        side_legs = side_legs.value() if side_legs else 2
-        reinf_extend = self.hole_inputs.get('reinf_extend_length', None)
-        reinf_extend = reinf_extend.value() if reinf_extend else 300
-
-        # 写入洞口数据（从UI读取所有参数）
-        ws_holes.append([
-            hx, hz, hw, hh, fr,
-            sb_long_dia, sb_long_count, sb_stirrup_dia, sb_stirrup_spacing,
-            left_reinf, right_reinf, side_spacing, side_dia, side_legs, reinf_extend
-        ])
-
-        # ========== Sheet 5: Loads ==========
-        # 关键：必须有X, X1, X2三个列！
-        # Concentrated荷载用X，Distributed荷载用X1和X2
-        ws_loads = wb.create_sheet("Loads")
-        ws_loads.append(["Case", "Stage", "Type", "X", "X1", "X2", "Direction", "Magnitude"])
-
-        # 获取梁长
         beam_length = self.geom_inputs['L'].value()
-
-        # 获取荷载值 (从UI读取，负值表示向下)
         dead_load_val = self.load_inputs.get('dead_load', None)
         dead_load = -abs(dead_load_val.value()) if dead_load_val else -15.0
         live_load_val = self.load_inputs.get('live_load', None)
         live_load = -abs(live_load_val.value()) if live_load_val else -20.0
+        loads_rows = [
+            {"Case": "Dead Load", "Stage": "Construction", "Type": "Distributed", "X": None, "X1": 0, "X2": beam_length, "Direction": "Z", "Magnitude": dead_load},
+            {"Case": "Dead Load", "Stage": "Service", "Type": "Distributed", "X": None, "X1": 0, "X2": beam_length, "Direction": "Z", "Magnitude": dead_load},
+            {"Case": "Live Load", "Stage": "Service", "Type": "Distributed", "X": None, "X1": 0, "X2": beam_length, "Direction": "Z", "Magnitude": live_load},
+        ]
 
-        # 施工阶段：仅自重（分布荷载，全跨）
-        ws_loads.append(["Dead Load", "Construction", "Distributed", None, 0, beam_length, "Z", dead_load])
-
-        # 使用阶段：自重+活载（分布荷载，全跨）
-        ws_loads.append(["Dead Load", "Service", "Distributed", None, 0, beam_length, "Z", dead_load])
-        ws_loads.append(["Live Load", "Service", "Distributed", None, 0, beam_length, "Z", live_load])
-
-        # ========== Sheet 6: Prestress ==========
-        # 关键：纵向Parameter-Value格式，不是横向列表！
-        ws_prestress = wb.create_sheet("Prestress")
-        ws_prestress.append(["Parameter", "Value"])
-
-        # 从UI获取预应力参数
         prestress_enabled = (self.prestress_inputs['enabled'].currentText() == "启用")
         prestress_force = self.prestress_inputs['force'].value()
         duct_diameter = self.prestress_inputs['duct_diameter'].value()
         method_text = str(self.prestress_inputs.get('method').currentText() if self.prestress_inputs.get('method') else "后张法(post_tension)")
         prestress_method = "pretension" if ("pretension" in method_text) else "post_tension"
-        # 先张法：不挖孔道，写入时强制 duct_diameter=0（避免误配置）
         if prestress_method == "pretension":
             duct_diameter = 0.0
+        prestress_rows = [
+            {"Parameter": "Enabled", "Value": str(prestress_enabled)},
+            {"Parameter": "Method", "Value": prestress_method},
+            {"Parameter": "Force", "Value": prestress_force if prestress_enabled else 0},
+            {"Parameter": "Duct_Diameter", "Value": duct_diameter if prestress_enabled else 0},
+            {"Parameter": "Path_Type", "Value": "straight"},
+        ]
 
-        # 纵向写入参数
-        ws_prestress.append(["Enabled", str(prestress_enabled)])
-        ws_prestress.append(["Method", prestress_method])
-        ws_prestress.append(["Force", prestress_force if prestress_enabled else 0])
-        ws_prestress.append(["Duct_Diameter", duct_diameter if prestress_enabled else 0])
-        ws_prestress.append(["Path_Type", "straight"])
+        boundary_rows = [
+            {"End": "Left", "Dx": "Fixed", "Dy": "Fixed", "Dz": "Fixed", "Rx": "Free", "Ry": "Free", "Rz": "Free", "N": 0, "Vy": 0, "Vz": 0, "Mx": 0, "My": 0, "Mz": 0},
+            {"End": "Right", "Dx": "Free", "Dy": "Fixed", "Dz": "Fixed", "Rx": "Free", "Ry": "Free", "Rz": "Free", "N": 0, "Vy": 0, "Vz": 0, "Mx": 0, "My": 0, "Mz": 0},
+        ]
 
-        # ========== Sheet 7: Boundary ==========
-        ws_boundary = wb.create_sheet("Boundary")
-        ws_boundary.append(["End", "Dx", "Dy", "Dz", "Rx", "Ry", "Rz", "N", "Vy", "Vz", "Mx", "My", "Mz"])
-        ws_boundary.append(["Left", "Fixed", "Fixed", "Fixed", "Free", "Free", "Free", 0, 0, 0, 0, 0, 0])
-        ws_boundary.append(["Right", "Free", "Fixed", "Fixed", "Free", "Free", "Free", 0, 0, 0, 0, 0, 0])
-
-        wb.save(excel_path)
+        write_table_workbook(
+            excel_path,
+            {
+                "Geometry": geometry_rows,
+                "Longitudinal Rebar": rebar_rows,
+                "Longitudinal Layout": longitudinal_layout_rows,
+                "Stirrups": stirrup_rows,
+                "Holes": holes_rows,
+                "Loads": loads_rows,
+                "Prestress": prestress_rows,
+                "Boundary": boundary_rows,
+            },
+        )
         return excel_path
 
     def generate_model(self):
@@ -1232,15 +1423,34 @@ class CompositeBeamUI(QMainWindow):
             self.log_text.append(">>> 开始生成 PKPM-CAE 叠合梁模型...")
             self.log_text.append("="*50)
 
-            # 保存UI参数到临时Excel
-            temp_excel = "temp_ui_params.xlsx"
-            self.log_text.append(f">>> 正在保存UI参数到 {temp_excel}...")
-            self._save_ui_params_to_excel(temp_excel)
-            self.log_text.append(">>> ✓ 参数已保存")
+            # 1) 优先使用用户选择的 Excel；若未选择，则从 UI 参数生成临时 Excel
+            input_excel = None
+            self._temp_excel_to_cleanup = None
+            # EXE(onefile) 模式下，避免写入 _MEIPASS 临时目录导致用户找不到输出
+            output_dir = current_dir
+            if hasattr(sys, "_MEIPASS"):
+                try:
+                    output_dir = os.path.dirname(os.path.abspath(sys.executable))
+                except Exception:
+                    output_dir = os.getcwd()
+            if self.excel_path and os.path.isfile(self.excel_path):
+                input_excel = self.excel_path
+                self.log_text.append(f">>> 使用 Excel 参数文件: {Path(input_excel).name}")
+            else:
+                temp_excel = os.path.join(output_dir, "temp_ui_params.xlsx")
+                self.log_text.append(f">>> 未选择 Excel，使用 UI 参数生成临时文件: {Path(temp_excel).name}")
+                self._save_ui_params_to_excel(temp_excel)
+                self._temp_excel_to_cleanup = temp_excel
+                input_excel = temp_excel
+                self.log_text.append(">>> ✓ 临时参数文件已生成")
 
             # 创建并启动后台线程
             self.log_text.append(">>> 启动模型生成引擎...")
-            self.generation_thread = ModelGenerationThread(temp_excel)
+            output_script = "pkpm_composite_beam_model.py"
+            if self._temp_excel_to_cleanup:
+                # UI 参数模式：固定输出到 exe 所在目录（或源码目录）
+                output_script = os.path.join(output_dir, "pkpm_composite_beam_model.py")
+            self.generation_thread = ModelGenerationThread(input_excel, output_script=output_script)
             self.generation_thread.progress.connect(self._on_generation_progress)
             self.generation_thread.finished.connect(self._on_generation_finished)
             self.generation_thread.start()
@@ -1263,9 +1473,10 @@ class CompositeBeamUI(QMainWindow):
         self.log_text.append(f">>> {message}")
         self.log_text.append("="*50)
 
-        # 清理临时文件
-        temp_excel = "temp_ui_params.xlsx"
-        if os.path.exists(temp_excel):
+        # 清理临时文件（仅当本次生成由 UI 参数自动生成）
+        temp_excel = self._temp_excel_to_cleanup
+        self._temp_excel_to_cleanup = None
+        if temp_excel and os.path.exists(temp_excel):
             try:
                 os.remove(temp_excel)
                 self.log_text.append(f">>> ✓ 已清理临时文件: {temp_excel}")

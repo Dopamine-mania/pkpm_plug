@@ -1,3 +1,31 @@
-① 运行软件；
-② 选取 Excel 并点击生成；
-③ 将生成的脚本拖入 PKPM-CAE 运行。
+① 启动方式（二选一）：
+   - 推荐交付形态（客户最省心）：dist/PKPM叠合梁工具.exe（无需客户安装 Python/依赖）
+   - 源码形态（备用）：双击 运行_UI界面.bat 或手动 python ui_main_pro.py
+   - 若启动失败：优先运行 运行_UI界面_调试.bat 获取报错；或查看日志：
+     - ui_bat.log（bat 启动日志，同目录）
+     - %TEMP%\pkpm_composite_beam_ui.log（UI 启动/运行日志）
+     - ui_error.log（同目录，UI 内部落盘）
+② 如需打包 EXE（Windows）：运行 打包EXE_使用当前Python环境.bat（会执行 build_exe.py），生成 dist/PKPM叠合梁工具.exe
+③ 一旦客户反馈“打不开/闪退”：让客户先运行 一键诊断.bat，把 diag.log 发回即可定位环境问题。
+
+【打包 EXE 常见失败处理】
+- 若 pip 报 TLS/代理错误（例如 ValueError: check_hostname requires server_hostname）：通常是代理变量配置异常或抓包代理干扰，建议关闭代理/VPN 后重试；必要时临时设置可用镜像：set PIP_INDEX_URL=https://pypi.org/simple
+- 若你机器已经有 Anaconda/PyQt5/PyInstaller，但 venv/pip 装依赖失败：直接运行 打包EXE_使用当前Python环境.bat（不创建 venv、不安装依赖，直接用现成环境打包）
+- 该模式实际执行：python build_exe.py（已自动排除 pandas/numpy/openpyxl，避免环境污染导致 PyInstaller 崩溃）
+
+【给客户怎么发最省心？】
+- 可以只发 dist/PKPM叠合梁工具.exe（客户无需 Python 环境）；但建议同时附带示例 Excel（便于客户快速验收/对照格式）。
+② 选择参数来源（两种方式任选其一）：
+   - 方式A：点击“浏览/读取 Excel”，再点“一键生成模型”；
+   - 方式B：直接在界面填写/调整参数，点“一键生成模型”（程序会自动生成临时 Excel）。
+   - 推荐先用：示例参数_客户验收_多直径.xlsx（工字型，含洞口+多直径钢筋）
+   - 另一个示例：示例参数_T梁_洞口_多直径.xlsx（T字形梁，含洞口）
+③ 输出脚本文件名固定为 pkpm_composite_beam_model.py：
+   - 输出到“程序目录”（便于统一交付/定位）
+   - 如需命令行生成：python main.py --excel 示例参数_客户验收_多直径.xlsx
+④ 将 pkpm_composite_beam_model.py 拖入 PKPM-CAE 运行，确保控制台 [CHECK] 均为 PASS；
+⑤ 网格后在 PKPM-CAE 内完成 4 步：
+   1) 网格：建议网格尺寸 <= 50mm；扫掠崩溃则改四面体(SolidTetra)；
+   2) 钢筋嵌入：创建“嵌入(Embeded)”关系，将钢筋(Link)嵌入混凝土实体单元；
+   3) 端部耦合：用 SUPPORT_REF_POINTS 参考点作主节点，对端面节点做 Coupling；
+   4) 叠合面绑定：对预制段与后浇层接触面创建 Tie/绑定。

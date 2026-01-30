@@ -3,7 +3,7 @@ PKPM-CAE 叠合梁参数化建模 - Excel 参数解析模块
 从 Excel 模板 V3.0 中读取参数并转换为参数对象
 """
 
-import pandas as pd
+import importlib
 from typing import Dict, Any, List, Optional
 import sys
 import os
@@ -50,12 +50,31 @@ class ExcelParser:
             ValueError: 参数解析失败
             FileNotFoundError: Excel 文件不存在
         """
+        # 读取策略：
+        # - 优先 pandas + openpyxl（若环境已安装依赖）
+        # - 若 openpyxl 缺失或读取失败，则回退到 stdlib-only 的最小 XLSX 读取器（仅支持本项目表格型sheet）
+        self._pd = None
+        self._use_minimal = True
+        self.excel_file = None
+
+        # 读取策略（尽量减少依赖与打包复杂度）：
+        # - 默认使用 stdlib-only 最小 XLSX 读取器（支持本项目模板的“表格型sheet”）
+        # - 若环境已安装 pandas 且 ExcelFile 可用，则自动切换为 pandas 读取（更宽容）
         try:
-            self.excel_file = pd.ExcelFile(self.excel_path, engine='openpyxl')
-        except FileNotFoundError:
-            raise FileNotFoundError(f"Excel 文件不存在: {self.excel_path}")
-        except Exception as e:
-            raise ValueError(f"无法打开 Excel 文件: {e}")
+            self._pd = importlib.import_module("pandas")
+        except Exception:
+            self._pd = None
+
+        if self._pd is not None:
+            try:
+                # 不显式指定 openpyxl，避免在无 openpyxl 环境下直接 ImportError
+                self.excel_file = self._pd.ExcelFile(self.excel_path)
+                self._use_minimal = False
+            except FileNotFoundError:
+                raise FileNotFoundError(f"Excel 文件不存在: {self.excel_path}")
+            except Exception:
+                self.excel_file = None
+                self._use_minimal = True
 
         # 解析各个 Sheet
         geometry = self._parse_geometry()
@@ -79,12 +98,31 @@ class ExcelParser:
 
         return params
 
+    def _is_na(self, v: Any) -> bool:
+        if v is None:
+            return True
+        try:
+            pd = getattr(self, "_pd", None)
+            if pd is not None and pd.isna(v):
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _read_rows(self, sheet_name: str) -> List[Dict[str, Any]]:
+        if getattr(self, "_use_minimal", False):
+            from parsers.xlsx_minimal import read_table_rows
+            return read_table_rows(self.excel_path, sheet_name)
+        pd = self._pd
+        df = pd.read_excel(self.excel_file, sheet_name=sheet_name, header=0)
+        return [row.to_dict() for _, row in df.iterrows()]
+
     def _parse_geometry(self) -> GeometryParams:
         """解析 Sheet 1: Geometry"""
-        df = pd.read_excel(self.excel_file, sheet_name='Geometry', header=0)
-
-        # 提取参数（假设数据在第一行）
-        data = df.iloc[0].to_dict()
+        rows = self._read_rows('Geometry')
+        if not rows:
+            raise ValueError("Geometry sheet 为空或不存在")
+        data = rows[0]
 
         return GeometryParams(
             L=float(data.get('L', 0)),
@@ -105,25 +143,50 @@ class ExcelParser:
 
     def _parse_longitudinal_rebar(self) -> LongitudinalRebar:
         """解析 Sheet 2: Longitudinal Rebar"""
-        df = pd.read_excel(self.excel_file, sheet_name='Longitudinal Rebar', header=0)
+        rows = self._read_rows('Longitudinal Rebar')
+
+        def _spec(dia, cnt, extend) -> Optional[RebarSpec]:
+            if self._is_na(dia) or self._is_na(cnt):
+                return None
+            try:
+                d = float(dia)
+                c = int(float(cnt))
+                e = float(extend or 0.0)
+            except Exception:
+                return None
+            if d <= 1e-6 or c <= 0:
+                return None
+            return RebarSpec(diameter=d, count=c, extend_length=e)
 
         # 解析各位置的配筋
         rebars = {}
-        for _, row in df.iterrows():
+        support_len = {}
+        for row in rows:
             position = row.get('Position', '')
+            if position is None:
+                continue
+            position = str(position).strip()
+            if not position:
+                continue
             dia_a = row.get('Diameter_A', 0)
             count_a = row.get('Count_A', 0)
             dia_b = row.get('Diameter_B', None)
             count_b = row.get('Count_B', None)
             extend = row.get('Extend_Length', 0)
 
-            rebar_a = RebarSpec(diameter=float(dia_a), count=int(count_a), extend_length=float(extend))
+            rebar_a = _spec(dia_a, count_a, extend)
 
             rebar_b = None
-            if dia_b and count_b and not pd.isna(dia_b) and not pd.isna(count_b):
-                rebar_b = RebarSpec(diameter=float(dia_b), count=int(count_b), extend_length=float(extend))
+            rebar_b = _spec(dia_b, count_b, extend)
 
-            rebars[position] = (rebar_a, rebar_b)
+            # 兼容：将“Top Through”映射为顶部通长筋（内部仍使用 mid_span_top 字段）
+            key = "Mid Span Top" if position in ["Top Through", "顶部通长", "TopThrough"] else position
+            rebars[key] = (rebar_a, rebar_b)
+            if key in ["Left Support Top", "Right Support Top"]:
+                try:
+                    support_len[key] = float(extend or 0.0)
+                except Exception:
+                    pass
 
         # 构建 LongitudinalRebar 对象
         left_a, left_b = rebars.get('Left Support Top', (None, None))
@@ -131,27 +194,77 @@ class ExcelParser:
         right_a, right_b = rebars.get('Right Support Top', (None, None))
         bottom_a, bottom_b = rebars.get('Bottom Through', (None, None))
 
-        return LongitudinalRebar(
-            left_support_top_A=left_a,
+        if mid_a is None:
+            raise ValueError("Longitudinal Rebar 缺少顶部通长筋：请提供 Position='Top Through' 或 'Mid Span Top' 的 Diameter_A/Count_A")
+        if bottom_a is None:
+            raise ValueError("Longitudinal Rebar 缺少底部通长筋：请提供 Position='Bottom Through' 的 Diameter_A/Count_A")
+
+        lr = LongitudinalRebar(
             left_support_top_B=left_b,
             mid_span_top=mid_a,
-            right_support_top_A=right_a,
             right_support_top_B=right_b,
             bottom_through_A=bottom_a,
             bottom_through_B=bottom_b
         )
+        # 支座附加筋（可选）
+        lr.left_support_top_A = left_a
+        lr.right_support_top_A = right_a
+        # 支座区长度：复用 Left/Right Support Top 行的 Extend_Length（更符合客户输入习惯）
+        try:
+            lr.left_support_length = float(support_len.get("Left Support Top", 0.0) or 0.0)
+        except Exception:
+            lr.left_support_length = 0.0
+        try:
+            lr.right_support_length = float(support_len.get("Right Support Top", 0.0) or 0.0)
+        except Exception:
+            lr.right_support_length = 0.0
+
+        # 多排纵筋参数（可选 Sheet: Longitudinal Layout）
+        # 表格格式：
+        # | Group | Rows | RowSpacing |
+        # | Top   | 2    | 40         |
+        # | Bottom| 2    | 40         |
+        try:
+            layout_rows = self._read_rows('Longitudinal Layout')
+        except Exception:
+            layout_rows = []
+        for r in layout_rows or []:
+            group = str(r.get('Group', '') or '').strip().lower()
+            if not group:
+                continue
+            try:
+                rows_n = int(float(r.get('Rows', 1) or 1))
+            except Exception:
+                rows_n = 1
+            try:
+                sp = float(r.get('RowSpacing', 0.0) or 0.0)
+            except Exception:
+                sp = 0.0
+
+            if group in ['top', '顶部', 'upper']:
+                lr.top_rows = max(1, rows_n)
+                lr.top_row_spacing = max(0.0, sp)
+            elif group in ['bottom', '底部', 'lower']:
+                lr.bottom_rows = max(1, rows_n)
+                lr.bottom_row_spacing = max(0.0, sp)
+
+        return lr
 
     def _parse_stirrup(self) -> StirrupParams:
         """解析 Sheet 3: Stirrups"""
-        df = pd.read_excel(self.excel_file, sheet_name='Stirrups', header=0)
+        rows = self._read_rows('Stirrups')
+        if not rows:
+            raise ValueError("Stirrups sheet 为空或不存在")
 
         # 假设数据格式：
         # | Zone | Spacing | Legs | Diameter |
         # | Dense | ... | ... | ... |
         # | Normal | ... | ... | ... |
 
-        dense_row = df[df['Zone'] == 'Dense'].iloc[0]
-        normal_row = df[df['Zone'] == 'Normal'].iloc[0]
+        dense_row = next((r for r in rows if str(r.get('Zone', '')).strip() == 'Dense'), None)
+        normal_row = next((r for r in rows if str(r.get('Zone', '')).strip() == 'Normal'), None)
+        if dense_row is None or normal_row is None:
+            raise ValueError("Stirrups sheet 缺少 Dense/Normal 行")
 
         # 加密区长度（从另一个字段读取或使用默认值）
         dense_length = dense_row.get('Length', 1500.0)
@@ -169,12 +282,12 @@ class ExcelParser:
 
     def _parse_holes(self) -> List[HoleParams]:
         """解析 Sheet 4: Holes"""
-        df = pd.read_excel(self.excel_file, sheet_name='Holes', header=0)
+        rows = self._read_rows('Holes')
 
         holes = []
-        for _, row in df.iterrows():
+        for row in rows:
             # 跳过空行
-            if pd.isna(row.get('X', None)):
+            if self._is_na(row.get('X', None)):
                 continue
 
             hole = HoleParams(
@@ -187,8 +300,13 @@ class ExcelParser:
                 # 小梁配筋
                 small_beam_long_diameter=float(row.get('SmallBeam_Long_Diameter', 0.0)),
                 small_beam_long_count=int(row.get('SmallBeam_Long_Count', 0)),
+                small_beam_long_top_diameter=float(row.get('SmallBeam_Long_Top_Diameter', 0.0)),
+                small_beam_long_top_count=int(row.get('SmallBeam_Long_Top_Count', 0)),
+                small_beam_long_bottom_diameter=float(row.get('SmallBeam_Long_Bottom_Diameter', 0.0)),
+                small_beam_long_bottom_count=int(row.get('SmallBeam_Long_Bottom_Count', 0)),
                 small_beam_stirrup_diameter=float(row.get('SmallBeam_Stirrup_Diameter', 0.0)),
                 small_beam_stirrup_spacing=float(row.get('SmallBeam_Stirrup_Spacing', 0.0)),
+                small_beam_stirrup_legs=int(row.get('SmallBeam_Stirrup_Legs', 0) or 0),
 
                 # 洞侧补强
                 left_reinf_length=float(row.get('Left_Reinf_Length', 0.0)),
@@ -204,11 +322,11 @@ class ExcelParser:
 
     def _parse_loads(self) -> List[LoadCase]:
         """解析 Sheet 5: Loads"""
-        df = pd.read_excel(self.excel_file, sheet_name='Loads', header=0)
+        rows = self._read_rows('Loads')
 
         # 按工况名称分组
         load_cases = {}
-        for _, row in df.iterrows():
+        for row in rows:
             case_name = row.get('Case', '')
             stage = row.get('Stage', 'Service')
 
@@ -235,9 +353,10 @@ class ExcelParser:
     def _parse_boundary(self) -> BoundaryCondition:
         """解析 Sheet 5: Boundary"""
         try:
-            df = pd.read_excel(self.excel_file, sheet_name='Boundary', header=0)
-        except ValueError:
-            # 如果没有 Boundary sheet，使用默认值
+            rows = self._read_rows('Boundary')
+        except Exception:
+            return BoundaryCondition()
+        if not rows:
             return BoundaryCondition()
 
         # 假设格式：
@@ -245,8 +364,10 @@ class ExcelParser:
         # | Left | ... | ... | ... |
         # | Right | ... | ... | ... |
 
-        left_row = df[df['End'] == 'Left'].iloc[0]
-        right_row = df[df['End'] == 'Right'].iloc[0]
+        left_row = next((r for r in rows if str(r.get('End', '')).strip() == 'Left'), None)
+        right_row = next((r for r in rows if str(r.get('End', '')).strip() == 'Right'), None)
+        if left_row is None or right_row is None:
+            return BoundaryCondition()
 
         def parse_constraint(row):
             return {
@@ -278,16 +399,17 @@ class ExcelParser:
     def _parse_prestress(self) -> Optional[PrestressParams]:
         """解析 Sheet 6: Prestress"""
         try:
-            df = pd.read_excel(self.excel_file, sheet_name='Prestress', header=0)
-        except ValueError:
-            # 如果没有 Prestress sheet，返回 None
+            rows = self._read_rows('Prestress')
+        except Exception:
+            return None
+        if not rows:
             return None
 
         def _get_value(param_name: str, default=None):
-            rows = df[df['Parameter'] == param_name]
-            if rows.empty:
-                return default
-            return rows.iloc[0].get('Value', default)
+            for r in rows:
+                if str(r.get('Parameter', '')).strip() == param_name:
+                    return r.get('Value', default)
+            return default
 
         enabled_raw = _get_value('Enabled', 'False')
         enabled = str(enabled_raw).lower() in ['true', 'yes', '1', 'enabled']
@@ -318,133 +440,3 @@ class ExcelParser:
             path_type=path_type
             # duct_path 将由 main.py 根据几何自动计算
         )
-
-
-def create_example_excel(output_path: str):
-    """
-    创建一个示例 Excel 模板文件，用于测试
-
-    Args:
-        output_path: 输出文件路径
-    """
-    with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
-        # Sheet 1: Geometry
-        geom_data = {
-            'L': [10000],
-            'H': [800],
-            'Tw': [250],
-            'bf_lu': [400],
-            'tf_lu': [150],
-            'bf_ru': [400],
-            'tf_ru': [150],
-            'bf_ll': [400],
-            'tf_ll': [150],
-            'bf_rl': [400],
-            'tf_rl': [150],
-            'h_pre': [500],
-            't_cast_cap': [0]
-        }
-        pd.DataFrame(geom_data).to_excel(writer, sheet_name='Geometry', index=False)
-
-        # Sheet 2: Longitudinal Rebar
-        rebar_data = {
-            'Position': ['Left Support Top', 'Mid Span Top', 'Right Support Top', 'Bottom Through'],
-            'Diameter_A': [25, 25, 25, 25],
-            'Count_A': [2, 2, 2, 4],
-            'Diameter_B': [22, None, 20, 22],
-            'Count_B': [3, None, 2, 2],
-            'Extend_Length': [3333, 0, 3333, 0]
-        }
-        pd.DataFrame(rebar_data).to_excel(writer, sheet_name='Longitudinal Rebar', index=False)
-
-        # Sheet 3: Stirrups
-        stirrup_data = {
-            'Zone': ['Dense', 'Normal'],
-            'Length': [1500, 0],
-            'Spacing': [100, 200],
-            'Legs': [4, 2],
-            'Diameter': [10, 8],
-            'Cover': [25, 25]
-        }
-        pd.DataFrame(stirrup_data).to_excel(writer, sheet_name='Stirrups', index=False)
-
-        # Sheet 4: Holes
-        holes_data = {
-            'X': [3000, 7000],
-            'Z': [400, 400],
-            'Width': [800, 1000],
-            'Height': [400, 400],
-            'Fillet_Radius': [0, 0],
-            'SmallBeam_Long_Diameter': [16, 16],
-            'SmallBeam_Long_Count': [2, 2],
-            'SmallBeam_Stirrup_Diameter': [8, 8],
-            'SmallBeam_Stirrup_Spacing': [150, 150],
-            'Left_Reinf_Length': [500, 500],
-            'Right_Reinf_Length': [500, 500],
-            'Side_Stirrup_Spacing': [100, 100],
-            'Side_Stirrup_Diameter': [10, 10],
-            'Side_Stirrup_Legs': [2, 2],
-            'Reinf_Extend_Length': [300, 300]
-        }
-        pd.DataFrame(holes_data).to_excel(writer, sheet_name='Holes', index=False)
-
-        # Sheet 5: Loads
-        loads_data = {
-            'Case': ['Dead Load', 'Dead Load', 'Live Load'],
-            'Stage': ['Construction', 'Construction', 'Service'],
-            'Type': ['Distributed', 'Concentrated', 'Distributed'],
-            'X': [None, 5000, None],
-            'X1': [0, None, 0],
-            'X2': [10000, None, 10000],
-            'Direction': ['Z', 'Z', 'Z'],
-            'Magnitude': [-10.0, -5000.0, -15.0]
-        }
-        pd.DataFrame(loads_data).to_excel(writer, sheet_name='Loads', index=False)
-
-        # Sheet 5 (另一个 tab): Boundary
-        boundary_data = {
-            'End': ['Left', 'Right'],
-            'Dx': ['Fixed', 'Fixed'],
-            'Dy': ['Fixed', 'Fixed'],
-            'Dz': ['Fixed', 'Free'],
-            'Rx': ['Free', 'Free'],
-            'Ry': ['Free', 'Free'],
-            'Rz': ['Free', 'Free'],
-            'N': [0, 0],
-            'Vy': [0, 0],
-            'Vz': [0, 0],
-            'Mx': [0, 0],
-            'My': [0, 0],
-            'Mz': [0, 0]
-        }
-        pd.DataFrame(boundary_data).to_excel(writer, sheet_name='Boundary', index=False)
-
-        # Sheet 6: Prestress (示例：不启用；method 默认后张法)
-        prestress_data = {
-            'Parameter': ['Enabled', 'Method', 'Force', 'Duct_Diameter', 'Path_Type'],
-            'Value': ['False', 'post_tension', 0, 0, 'straight']
-        }
-        pd.DataFrame(prestress_data).to_excel(writer, sheet_name='Prestress', index=False)
-
-    print(f"示例 Excel 文件已创建: {output_path}")
-
-
-if __name__ == "__main__":
-    # 测试代码：创建示例 Excel 文件
-    example_path = "example_beam_parameters.xlsx"
-    create_example_excel(example_path)
-
-    # 测试解析
-    parser = ExcelParser(example_path)
-    params = parser.parse()
-
-    # 验证并打印摘要
-    is_valid, errors = params.validate()
-    print(params.summary())
-
-    if not is_valid:
-        print("\n参数校验失败:")
-        for error in errors:
-            print(f"  - {error}")
-    else:
-        print("\n参数校验通过!")

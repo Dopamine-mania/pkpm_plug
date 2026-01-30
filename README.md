@@ -1,6 +1,6 @@
 # PKPM-CAE 叠合梁参数化建模工具（交接版）
 
-本仓库用于交接“PKPM-CAE 叠合梁参数化建模工具”项目：从 Excel/UI 参数生成可在 PKPM-CAE 运行的 PyPCAE 脚本，覆盖张工提出的关键建模/验收点，并内置 `[CHECK]` 体检日志用于定量验收与快速定位问题。
+本仓库用于交接“PKPM-CAE 叠合梁参数化建模工具”项目：从 Excel/UI 参数生成可在 PKPM-CAE 运行的 PyPCAE 脚本，覆盖客户反馈的关键建模/验收点，并内置 `[CHECK]` 体检日志用于定量验收与快速定位问题。
 
 ## 你需要先知道的 3 件事（非常重要）
 
@@ -66,7 +66,7 @@
 ## 预应力说明（先张/后张）
 
 - `Prestress.Method=post_tension`：后张法，可预留孔道（duct）并施加预应力。
-- `Prestress.Method=pretension`：先张法，不挖孔道（脚本会强制 `duct_diameter=0`），仅施加 `PreStress`（更稳的网格/更符合张工常用流程）。
+- `Prestress.Method=pretension`：先张法，不挖孔道（脚本会强制 `duct_diameter=0`），仅施加 `PreStress`（更稳的网格/更符合常见工程流程）。
 
 ## 时间线（交接用）
 
@@ -89,4 +89,3 @@
 
 - 不要猜 API：遇到不确定方法，先查 `Demond/README.md` 与 `Demond/` 示例脚本。
 - 所有修复都必须补 `[CHECK]` 证据项，并能在客户用例上复现 PASS。
-
