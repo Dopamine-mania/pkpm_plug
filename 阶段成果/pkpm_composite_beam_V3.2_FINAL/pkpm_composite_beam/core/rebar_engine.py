@@ -832,6 +832,29 @@ class RebarEngine:
                             pass
                         elements.append(e_mid)
 
+            # 20260203 客户反馈：非加密区缺少翼缘箍筋
+            # - 即使按“2肢/腹板矩形”退化，也需要在下翼缘范围补一个闭合环，保证洞口范围外翼缘箍筋不缺失。
+            # - 仅在确实存在下翼缘高度（z_flange_top > z_bottom）且 y_outer != y_inner 时启用。
+            try:
+                if abs(float(y_outer) - float(y_inner)) > 1e-6:
+                    zf = min(float(z_flange_top_left), float(z_flange_top_right))
+                    if zf > float(z_bottom) + 1e-6:
+                        f1 = Node(x, -float(y_outer), float(z_bottom))
+                        f2 = Node(x, float(y_outer), float(z_bottom))
+                        f3 = Node(x, float(y_outer), float(zf))
+                        f4 = Node(x, -float(y_outer), float(zf))
+                        nodes.extend([f1, f2, f3, f4])
+                        flange_elems = [
+                            Element([f1.id, f2.id], etype=EleType.Link),
+                            Element([f2.id, f3.id], etype=EleType.Link),
+                            Element([f3.id, f4.id], etype=EleType.Link),
+                            Element([f4.id, f1.id], etype=EleType.Link),
+                        ]
+                        self._tag_elements_diameter(flange_elems, diameter)
+                        elements.extend(flange_elems)
+            except Exception:
+                pass
+
             # 上翼缘闭合环：仍按原逻辑补齐（若存在上翼缘）
             try:
                 g = self.geometry
@@ -907,11 +930,24 @@ class RebarEngine:
         e8 = Element([n5.id, n7.id], etype=EleType.Link)  # 左翼缘顶横边
         e9 = Element([n8.id, n6.id], etype=EleType.Link)  # 右翼缘顶横边
 
+        # 20260203 客户反馈：加密区翼缘顶部在腹板范围未闭合
+        # - 对“左右下翼缘顶标高一致”的情况，在 z=z_flange_top 处补一段贯通翼缘宽度的顶边（E->F），保证翼缘箍筋闭合观感。
+        # - 若左右翼缘顶高度不一致（非对称截面），不补这条斜边，避免生成穿越实体外的斜杆。
+        e13 = None
+        try:
+            if abs(float(z_flange_top_left) - float(z_flange_top_right)) <= 1e-6:
+                e13 = Element([n5.id, n6.id], etype=EleType.Link)  # 翼缘顶贯通边
+        except Exception:
+            e13 = None
+
         # 顶部横向边（腹板宽度）
         e10 = Element([n9.id, n10.id], etype=EleType.Link)  # 顶边
 
         # 注：不在 z=z_flange_top 处额外添加横向连筋，避免出现“多一条水平钢筋/中间横线”的观感与肢数歧义
-        elements.extend([e1, e2, e3, e4, e5, e6, e7, e8, e9, e10, e11, e12])
+        base_elems = [e1, e2, e3, e4, e5, e6, e7, e8, e9, e10, e11, e12]
+        if e13 is not None:
+            base_elems.append(e13)
+        elements.extend(base_elems)
         self._tag_elements_diameter(elements, diameter)
 
         # === 多肢箍筋：添加中间内肢（避免把 4 肢误生成成 6 肢）===
