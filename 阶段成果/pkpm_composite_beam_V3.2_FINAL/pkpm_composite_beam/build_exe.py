@@ -40,6 +40,8 @@ def main() -> int:
         "--add-data",
         "示例参数_T梁_洞口_多直径.xlsx;.",
         "--add-data",
+        "示例参数_多洞口_多排纵筋.xlsx;.",
+        "--add-data",
         "上手指南.txt;.",
         "--exclude-module",
         "pandas",
@@ -66,4 +68,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

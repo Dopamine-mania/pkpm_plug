@@ -50,6 +50,7 @@ def main() -> int:
             base_dir / "上手指南.txt",
             base_dir / "示例参数_客户验收_多直径.xlsx",
             base_dir / "示例参数_T梁_洞口_多直径.xlsx",
+            base_dir / "示例参数_多洞口_多排纵筋.xlsx",
         }
         files = [p for p in allow if p.exists()]
         zip_path = base_dir / f"PKPM叠合梁工具_客户交付包_{stamp}.zip"
